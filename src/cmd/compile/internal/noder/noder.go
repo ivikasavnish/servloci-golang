@@ -79,6 +79,7 @@ func LoadPackage(filenames []string) {
 		rewriteDecorators(p.file)
 		rewriteTryOperator(p.file)
 		rewriteSerdeDecorators(p.file)
+		rewriteRPCDecorators(p.file)
 	}
 
 	unified(m, noders)
@@ -790,6 +791,305 @@ func writeSerdeDecodeField(w *strings.Builder, target string, t syntax.Expr, ctr
 		fmt.Fprintf(w, "%s[%s] = %s\n}\n", mp, kv, vv)
 		fmt.Fprintf(w, "if err := d.DecodeMapEnd(); err != nil {\nreturn err\n}\n%s = %s\n", target, mp)
 	}
+}
+
+// rewriteRPCDecorators finds interface type declarations tagged @rpc and
+// generates a real gRPC client + server (ServiceDesc, handlers,
+// Register...Server) for them -- no .proto file, no protoc, no generated
+// _pb.go. The interface itself is the service definition (server-side
+// contract); request/response types are expected to be @serde structs.
+//
+// Wire format is gRPC's pluggable encoding.Codec (serde.SerdeCodec, in the
+// runtime library) instead of protobuf -- real gRPC transport (HTTP/2,
+// deadlines, interceptors, all four streaming shapes) with zero protobuf.
+// This means it only interoperates with other gpp-compiled services, not
+// arbitrary protoc-generated clients in other languages -- a deliberate
+// v1 scope choice, not an oversight.
+//
+// Same reparse-generated-source-text approach as rewriteSerdeDecorators,
+// for the same reason: far fewer places to get an AST node shape wrong
+// across four different method shapes (unary + 3 streaming variants) than
+// hand-building every statement node.
+func rewriteRPCDecorators(file *syntax.File) {
+	if file == nil {
+		return
+	}
+	var pm posMap
+	for _, decl := range file.DeclList {
+		td, ok := decl.(*syntax.TypeDecl)
+		if !ok || !hasRPCDecorator(td.Decorators) {
+			continue
+		}
+		if len(td.TParamList) > 0 {
+			base.ErrorfAt(pm.pos(td), 0, "@rpc does not support generic types")
+			continue
+		}
+		it, ok := td.Type.(*syntax.InterfaceType)
+		if !ok {
+			base.ErrorfAt(pm.pos(td), 0, "@rpc can only be applied to interface types")
+			continue
+		}
+
+		src, ok := genRPCSource(&pm, td.Name.Value, it.MethodList)
+		if !ok {
+			continue // errors already reported at the offending methods
+		}
+
+		synthBase := syntax.NewFileBase(fmt.Sprintf("<rpc:%s>", td.Name.Value))
+		synth, err := syntax.Parse(synthBase, strings.NewReader(src), func(e error) {
+			base.Fatalf("gpp: internal error: generated @rpc code for %s failed to parse: %v\n---\n%s", td.Name.Value, e, src)
+		}, nil, 0)
+		if err != nil || synth == nil {
+			base.Fatalf("gpp: internal error: generated @rpc code for %s failed to parse: %v\n---\n%s", td.Name.Value, err, src)
+		}
+		file.DeclList = append(file.DeclList, synth.DeclList...)
+	}
+}
+
+func hasRPCDecorator(decorators []*syntax.Decorator) bool {
+	for _, d := range decorators {
+		if d.Name != nil && d.Name.Value == "rpc" {
+			return true
+		}
+	}
+	return false
+}
+
+type rpcMethodKind int
+
+const (
+	rpcUnsupported rpcMethodKind = iota
+	rpcUnary
+	rpcServerStream
+	rpcClientStream
+	rpcBidiStream
+)
+
+type rpcMethod struct {
+	name     string
+	kind     rpcMethodKind
+	reqName  string
+	respName string
+}
+
+// unwrapPointer reports whether t is *X (written as a prefix-* Operation,
+// the same shape classifySerdeType/tryZero already deal with), returning X.
+func unwrapPointer(t syntax.Expr) (syntax.Expr, bool) {
+	op, ok := t.(*syntax.Operation)
+	if !ok || op.Op != syntax.Mul || op.Y != nil {
+		return t, false
+	}
+	return op.X, true
+}
+
+func typeNameOf(t syntax.Expr) (string, bool) {
+	inner, _ := unwrapPointer(t)
+	n, ok := inner.(*syntax.Name)
+	if !ok {
+		return "", false
+	}
+	return n.Value, true
+}
+
+// streamShape recognizes *rpc.ServerStream[T], *rpc.ClientStream[T], or
+// *rpc.BidiStream[Req, Resp] (the package qualifier/alias is irrelevant --
+// only the trailing identifier and generic arity are checked), returning
+// the trailing name and its type arguments.
+func streamShape(t syntax.Expr) (name string, args []syntax.Expr, ok bool) {
+	inner, isPtr := unwrapPointer(t)
+	if !isPtr {
+		return "", nil, false
+	}
+	idx, isIdx := inner.(*syntax.IndexExpr)
+	if !isIdx {
+		return "", nil, false
+	}
+	var sel *syntax.Name
+	switch x := idx.X.(type) {
+	case *syntax.Name:
+		sel = x
+	case *syntax.SelectorExpr:
+		sel = x.Sel
+	default:
+		return "", nil, false
+	}
+	if le, isList := idx.Index.(*syntax.ListExpr); isList {
+		return sel.Value, le.ElemList, true
+	}
+	return sel.Value, []syntax.Expr{idx.Index}, true
+}
+
+// classifyRPCMethod pattern-matches one of the four supported method
+// shapes purely from the syntax tree (no typecheck available yet):
+//
+//	unary:         (ctx, *Req) (*Resp, error)
+//	server-stream: (req *Req, stream *rpc.ServerStream[Resp]) error
+//	client-stream: (stream *rpc.ClientStream[Req]) (*Resp, error)
+//	bidi:          (stream *rpc.BidiStream[Req, Resp]) error
+func classifyRPCMethod(ft *syntax.FuncType) (rpcMethod, bool) {
+	params, results := ft.ParamList, ft.ResultList
+
+	switch {
+	case len(params) == 2 && len(results) == 2 && isErrorType(results[1].Type):
+		if _, isPtr := unwrapPointer(params[1].Type); isPtr {
+			if _, isPtr2 := unwrapPointer(results[0].Type); isPtr2 {
+				if reqName, ok := typeNameOf(params[1].Type); ok {
+					if respName, ok2 := typeNameOf(results[0].Type); ok2 {
+						return rpcMethod{kind: rpcUnary, reqName: reqName, respName: respName}, true
+					}
+				}
+			}
+		}
+
+	case len(params) == 2 && len(results) == 1 && isErrorType(results[0].Type):
+		if sname, args, ok := streamShape(params[1].Type); ok && sname == "ServerStream" && len(args) == 1 {
+			if reqName, ok2 := typeNameOf(params[0].Type); ok2 {
+				if respName, ok3 := typeNameOf(args[0]); ok3 {
+					return rpcMethod{kind: rpcServerStream, reqName: reqName, respName: respName}, true
+				}
+			}
+		}
+
+	case len(params) == 1 && len(results) == 2 && isErrorType(results[1].Type):
+		if sname, args, ok := streamShape(params[0].Type); ok && sname == "ClientStream" && len(args) == 1 {
+			if _, isPtr := unwrapPointer(results[0].Type); isPtr {
+				if reqName, ok2 := typeNameOf(args[0]); ok2 {
+					if respName, ok3 := typeNameOf(results[0].Type); ok3 {
+						return rpcMethod{kind: rpcClientStream, reqName: reqName, respName: respName}, true
+					}
+				}
+			}
+		}
+
+	case len(params) == 1 && len(results) == 1 && isErrorType(results[0].Type):
+		if sname, args, ok := streamShape(params[0].Type); ok && sname == "BidiStream" && len(args) == 2 {
+			if reqName, ok2 := typeNameOf(args[0]); ok2 {
+				if respName, ok3 := typeNameOf(args[1]); ok3 {
+					return rpcMethod{kind: rpcBidiStream, reqName: reqName, respName: respName}, true
+				}
+			}
+		}
+	}
+
+	return rpcMethod{}, false
+}
+
+// genRPCSource builds the full Go source (client type, ServiceDesc,
+// handlers, Register...Server) for ifaceName's @rpc interface. ok is
+// false if any method didn't match a supported shape (already reported
+// via base.ErrorfAt at that method's position).
+func genRPCSource(pm *posMap, ifaceName string, methodFields []*syntax.Field) (string, bool) {
+	var methods []rpcMethod
+	ok := true
+	for _, f := range methodFields {
+		if f.Name == nil {
+			continue // embedded interface, unsupported in v1, silently skipped
+		}
+		ft, isFn := f.Type.(*syntax.FuncType)
+		if !isFn {
+			continue
+		}
+		m, mOk := classifyRPCMethod(ft)
+		if !mOk {
+			base.ErrorfAt(pm.pos(f.Type), 0, "@rpc: method %s.%s doesn't match a supported RPC shape "+
+				"(unary: (ctx, *Req)(*Resp, error); server-stream: (*Req, *rpc.ServerStream[Resp]) error; "+
+				"client-stream: (*rpc.ClientStream[Req]) (*Resp, error); bidi: (*rpc.BidiStream[Req, Resp]) error)",
+				ifaceName, f.Name.Value)
+			ok = false
+			continue
+		}
+		m.name = f.Name.Value
+		methods = append(methods, m)
+	}
+	if !ok {
+		return "", false
+	}
+
+	lowerFirst := func(s string) string {
+		if s == "" {
+			return s
+		}
+		return strings.ToLower(s[:1]) + s[1:]
+	}
+	clientType := ifaceName + "Client"
+	implVar := lowerFirst(ifaceName) + "Client"
+
+	var clientIface, clientImpl, handlers, methodDescs, streamDescs strings.Builder
+
+	for _, m := range methods {
+		full := fmt.Sprintf("/%s/%s", ifaceName, m.name)
+		switch m.kind {
+		case rpcUnary:
+			fmt.Fprintf(&clientIface, "%s(ctx context.Context, req *%s) (*%s, error)\n", m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "func (c *%s) %s(ctx context.Context, req *%s) (*%s, error) {\n", implVar, m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "out := new(%s)\nif err := c.cc.Invoke(ctx, %q, req, out); err != nil {\nreturn nil, err\n}\nreturn out, nil\n}\n\n", m.respName, full)
+
+			fmt.Fprintf(&handlers, "func _%s_%s_Handler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {\n", ifaceName, m.name)
+			fmt.Fprintf(&handlers, "in := new(%s)\nif err := dec(in); err != nil {\nreturn nil, err\n}\n", m.reqName)
+			fmt.Fprintf(&handlers, "if interceptor == nil {\nreturn srv.(%s).%s(ctx, in)\n}\n", ifaceName, m.name)
+			fmt.Fprintf(&handlers, "info := &grpc.UnaryServerInfo{Server: srv, FullMethod: %q}\n", full)
+			fmt.Fprintf(&handlers, "handler := func(ctx context.Context, req any) (any, error) {\nreturn srv.(%s).%s(ctx, req.(*%s))\n}\n", ifaceName, m.name, m.reqName)
+			handlers.WriteString("return interceptor(ctx, in, info, handler)\n}\n\n")
+
+			fmt.Fprintf(&methodDescs, "{MethodName: %q, Handler: _%s_%s_Handler},\n", m.name, ifaceName, m.name)
+
+		case rpcServerStream:
+			fmt.Fprintf(&clientIface, "%s(ctx context.Context, req *%s) (*rpc.ClientRecvStream[%s], error)\n", m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "func (c *%s) %s(ctx context.Context, req *%s) (*rpc.ClientRecvStream[%s], error) {\n", implVar, m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "stream, err := c.cc.NewStream(ctx, &grpc.StreamDesc{StreamName: %q, ServerStreams: true}, %q)\nif err != nil {\nreturn nil, err\n}\n", m.name, full)
+			clientImpl.WriteString("if err := stream.SendMsg(req); err != nil {\nreturn nil, err\n}\n")
+			clientImpl.WriteString("if err := stream.CloseSend(); err != nil {\nreturn nil, err\n}\n")
+			fmt.Fprintf(&clientImpl, "return &rpc.ClientRecvStream[%s]{ClientStream: stream}, nil\n}\n\n", m.respName)
+
+			fmt.Fprintf(&handlers, "func _%s_%s_Handler(srv any, stream grpc.ServerStream) error {\n", ifaceName, m.name)
+			fmt.Fprintf(&handlers, "in := new(%s)\nif err := stream.RecvMsg(in); err != nil {\nreturn err\n}\n", m.reqName)
+			fmt.Fprintf(&handlers, "return srv.(%s).%s(in, &rpc.ServerStream[%s]{ServerStream: stream})\n}\n\n", ifaceName, m.name, m.respName)
+
+			fmt.Fprintf(&streamDescs, "{StreamName: %q, Handler: _%s_%s_Handler, ServerStreams: true},\n", m.name, ifaceName, m.name)
+
+		case rpcClientStream:
+			fmt.Fprintf(&clientIface, "%s(ctx context.Context) (*rpc.ClientSendStream[%s, %s], error)\n", m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "func (c *%s) %s(ctx context.Context) (*rpc.ClientSendStream[%s, %s], error) {\n", implVar, m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "stream, err := c.cc.NewStream(ctx, &grpc.StreamDesc{StreamName: %q, ClientStreams: true}, %q)\nif err != nil {\nreturn nil, err\n}\n", m.name, full)
+			fmt.Fprintf(&clientImpl, "return &rpc.ClientSendStream[%s, %s]{ClientStream: stream}, nil\n}\n\n", m.reqName, m.respName)
+
+			fmt.Fprintf(&handlers, "func _%s_%s_Handler(srv any, stream grpc.ServerStream) error {\n", ifaceName, m.name)
+			fmt.Fprintf(&handlers, "resp, err := srv.(%s).%s(&rpc.ClientStream[%s]{ServerStream: stream})\nif err != nil {\nreturn err\n}\n", ifaceName, m.name, m.reqName)
+			handlers.WriteString("return stream.SendMsg(resp)\n}\n\n")
+
+			fmt.Fprintf(&streamDescs, "{StreamName: %q, Handler: _%s_%s_Handler, ClientStreams: true},\n", m.name, ifaceName, m.name)
+
+		case rpcBidiStream:
+			fmt.Fprintf(&clientIface, "%s(ctx context.Context) (*rpc.ClientBidiStream[%s, %s], error)\n", m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "func (c *%s) %s(ctx context.Context) (*rpc.ClientBidiStream[%s, %s], error) {\n", implVar, m.name, m.reqName, m.respName)
+			fmt.Fprintf(&clientImpl, "stream, err := c.cc.NewStream(ctx, &grpc.StreamDesc{StreamName: %q, ServerStreams: true, ClientStreams: true}, %q)\nif err != nil {\nreturn nil, err\n}\n", m.name, full)
+			fmt.Fprintf(&clientImpl, "return &rpc.ClientBidiStream[%s, %s]{ClientStream: stream}, nil\n}\n\n", m.reqName, m.respName)
+
+			fmt.Fprintf(&handlers, "func _%s_%s_Handler(srv any, stream grpc.ServerStream) error {\n", ifaceName, m.name)
+			fmt.Fprintf(&handlers, "return srv.(%s).%s(&rpc.BidiStream[%s, %s]{ServerStream: stream})\n}\n\n", ifaceName, m.name, m.reqName, m.respName)
+
+			fmt.Fprintf(&streamDescs, "{StreamName: %q, Handler: _%s_%s_Handler, ServerStreams: true, ClientStreams: true},\n", m.name, ifaceName, m.name)
+		}
+	}
+
+	// No import block: this splices into the same file that declared the
+	// @rpc interface, which (to have typechecked at all) must already
+	// import "context", "google.golang.org/grpc" as grpc, and its stream
+	// runtime package as rpc -- re-importing the same paths here would be
+	// a duplicate-import error. Same convention as @serde's bare
+	// Encoder/Decoder: required identifiers must already be in scope.
+	var out strings.Builder
+	out.WriteString("package p\n\n")
+	fmt.Fprintf(&out, "type %s interface {\n%s}\n\n", clientType, clientIface.String())
+	fmt.Fprintf(&out, "type %s struct {\ncc grpc.ClientConnInterface\n}\n\n", implVar)
+	fmt.Fprintf(&out, "func New%s(cc grpc.ClientConnInterface) %s {\nreturn &%s{cc: cc}\n}\n\n", clientType, clientType, implVar)
+	out.WriteString(clientImpl.String())
+	out.WriteString(handlers.String())
+	fmt.Fprintf(&out, "var _%s_ServiceDesc = grpc.ServiceDesc{\nServiceName: %q,\nHandlerType: (*%s)(nil),\nMethods: []grpc.MethodDesc{\n%s},\nStreams: []grpc.StreamDesc{\n%s},\nMetadata: %q,\n}\n\n",
+		ifaceName, ifaceName, ifaceName, methodDescs.String(), streamDescs.String(), ifaceName)
+	fmt.Fprintf(&out, "func Register%sServer(s grpc.ServiceRegistrar, impl %s) {\ns.RegisterService(&_%s_ServiceDesc, impl)\n}\n", ifaceName, ifaceName, ifaceName)
+
+	return out.String(), true
 }
 
 // trimFilename returns the "trimmed" filename of b, which is the
