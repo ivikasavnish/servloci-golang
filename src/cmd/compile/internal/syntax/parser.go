@@ -1164,10 +1164,32 @@ func (p *parser) pexpr(x Expr, keep_parens bool) Expr {
 		x = p.operand(keep_parens)
 	}
 
+	// pendingTry records that the immediately preceding token was a bare
+	// '?' following a call expression (x), and that call is awaiting an
+	// optional '[' Index ']' to select which non-error result it yields
+	// (Fun(...)?[i]). It is consumed by the very next loop iteration.
+	var pendingTry *CallExpr
+
 loop:
 	for {
 		pos := p.pos()
 		switch p.tok {
+		case _Question:
+			p.next()
+			call, ok := x.(*CallExpr)
+			if !ok {
+				p.syntaxError("? operator requires a function call")
+				p.advance(_Semi, _Rparen)
+				break
+			}
+			if p.tok == _Lbrack {
+				// Fun(...)?[i] -- defer marking until the '[' handler below
+				// builds the IndexExpr around this same call.
+				pendingTry = call
+			} else {
+				call.Try = true
+			}
+
 		case _Dot:
 			p.next()
 			switch p.tok {
@@ -1217,6 +1239,8 @@ loop:
 			}
 
 		case _Lbrack:
+			try := pendingTry
+			pendingTry = nil
 			p.next()
 
 			var i Expr
@@ -1236,9 +1260,19 @@ loop:
 					t.pos = pos
 					t.X = x
 					t.Index = i
+					if try != nil {
+						if comma {
+							p.syntaxError("?[...] requires a single index")
+						} else {
+							t.TrySelect = true
+						}
+					}
 					x = t
 					break
 				}
+			}
+			if try != nil {
+				p.syntaxError("?[...] requires a single index")
 			}
 
 			// x[i:...

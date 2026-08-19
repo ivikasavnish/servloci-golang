@@ -61,6 +61,47 @@ order-of-evaluation pass), and is restricted to pointer/interface base
 types — `?.` on a plain value type is a compile error, not silently
 ignored. See `test_nil_safety.go` and `NIL_SAFE_OPERATOR_STATUS.md`.
 
+### Error-propagating call (`?`, `?[i]`)
+
+Rust-style `?`, adapted for Go's multi-value returns:
+
+```go
+func divide(a, b int) (int, error) { ... }
+
+func safeDivide(a, b int) (int, error) {
+    q := divide(a, b)?      // q is int; on error, returns (0, err) immediately
+    return q, nil
+}
+```
+
+For functions returning more than one non-error value, pick which one to
+keep with `?[i]`:
+
+```go
+func splitAdd(a, b int) (int, int, error) { ... }
+
+quot := splitAdd(a, b)?[0]
+rem  := splitAdd(a, b)?[1]
+```
+
+Rewritten pre-typecheck (`noder.rewriteTryOperator`), same source-to-source
+approach as decorators: `x := f()?` becomes a temp multi-assignment plus an
+`if err != nil { return <zero>..., err }` spliced in before the statement.
+Non-selected results are discarded to `_`.
+
+**Scope (v1):** `Fun` in `Fun(...)?` must be a plain identifier naming a
+package-level function declared in the *same file*, so its result
+signature is known from the syntax tree alone, without running the
+typechecker. This means it does **not** chain through method calls —
+`foo()?.Bar()?` only lowers the first `?`; the second one sits on a method
+call whose signature isn't known pre-typecheck, so it's left untouched and
+surfaces as a normal Go compile error (`multiple-value ... in single-value
+context`), never a miscompile. Full method-chaining support would need the
+operator taught to `types2` (so chained calls typecheck against the
+post-`?` result type) and lowered post-typecheck in `walk`, mirroring how
+`?.` is done — a substantially bigger change, not yet implemented. See
+`test_try_operator.go`.
+
 ---
 
 # The Go Programming Language

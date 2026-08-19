@@ -206,9 +206,12 @@ type (
 
 	// X[Index]
 	// X[T1, T2, ...] (with Ti = Index.(*ListExpr).ElemList[i])
+	// X?[Index] (with X.(*CallExpr).Try == true, Index a constant int):
+	// selects the Index'th non-error result of a Try call, TrySelect == true.
 	IndexExpr struct {
-		X     Expr
-		Index Expr
+		X         Expr
+		Index     Expr
+		TrySelect bool
 		expr
 	}
 
@@ -250,6 +253,7 @@ type (
 		Fun     Expr
 		ArgList []Expr // nil means no arguments
 		HasDots bool   // last argument is followed by ...
+		Try     bool   // true if written Fun(...)? -- bare error-propagating call
 		expr
 	}
 

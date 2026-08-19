@@ -77,6 +77,7 @@ func LoadPackage(filenames []string) {
 	// Rewrite decorator syntax into true function wrapping before typechecking.
 	for _, p := range noders {
 		rewriteDecorators(p.file)
+		rewriteTryOperator(p.file)
 	}
 
 	unified(m, noders)
@@ -216,6 +217,278 @@ func rewriteDecorators(file *syntax.File) {
 
 		fd.Body.List = []syntax.Stmt{stmt}
 	}
+}
+
+// rewriteTryOperator desugars the bare error-propagating call operator
+// (Fun(...)? and Fun(...)?[i]) into explicit temp-assignment plus
+// early-return statements, before typechecking:
+//
+//	x := f()?
+//
+// becomes
+//
+//	_gppTry1, _gppTry2 := f()
+//	if _gppTry2 != nil {
+//		return <zero of enclosing func's other results>..., _gppTry2
+//	}
+//	x := _gppTry1
+//
+// and f()?[i] selects the i'th non-error result the same way.
+//
+// v1 scope: Fun must be a plain identifier naming a package-level function
+// declared in the same file, so its result signature (arity, and whether
+// the last result is exactly `error`) is known syntactically without
+// running the typechecker. This means the operator does not chain through
+// method calls (foo()?.Bar()? -- Bar's signature isn't known until after
+// typecheck): any Try/TrySelect flag this pass can't resolve is simply
+// left in the tree, where it falls through to types2 as an ordinary
+// multi-value call in a single-value context -- a normal Go compile error,
+// never a miscompile.
+func rewriteTryOperator(file *syntax.File) {
+	if file == nil {
+		return
+	}
+
+	sigs := map[string][]syntax.Expr{}
+	for _, decl := range file.DeclList {
+		fd, ok := decl.(*syntax.FuncDecl)
+		if !ok || fd.Recv != nil || fd.Name == nil {
+			continue
+		}
+		sigs[fd.Name.Value] = resultTypes(fd.Type.ResultList)
+	}
+
+	for _, decl := range file.DeclList {
+		fd, ok := decl.(*syntax.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		fd.Body.List = rewriteTryBlock(fd.Body.List, resultTypes(fd.Type.ResultList), sigs)
+	}
+}
+
+func resultTypes(fields []*syntax.Field) []syntax.Expr {
+	out := make([]syntax.Expr, len(fields))
+	for i, f := range fields {
+		out[i] = f.Type
+	}
+	return out
+}
+
+// rewriteTryBlock rewrites every statement in list, recursing into nested
+// control-flow bodies (which share the same enclosing function, and so the
+// same results), and returns the (possibly longer) replacement list.
+func rewriteTryBlock(list []syntax.Stmt, results []syntax.Expr, sigs map[string][]syntax.Expr) []syntax.Stmt {
+	if list == nil {
+		return nil
+	}
+	out := make([]syntax.Stmt, 0, len(list))
+	for _, stmt := range list {
+		out = append(out, expandTryStmt(stmt, results, sigs)...)
+	}
+	return out
+}
+
+// expandTryStmt recurses into stmt's nested blocks in place, then checks
+// whether stmt itself directly carries a top-level Try/TrySelect call
+// (single '?' per statement -- v1 does not hoist nested occurrences deeper
+// inside an expression tree). It returns the statement(s) that should
+// replace stmt in its containing list.
+func expandTryStmt(stmt syntax.Stmt, results []syntax.Expr, sigs map[string][]syntax.Expr) []syntax.Stmt {
+	switch s := stmt.(type) {
+	case *syntax.BlockStmt:
+		s.List = rewriteTryBlock(s.List, results, sigs)
+
+	case *syntax.IfStmt:
+		s.Then.List = rewriteTryBlock(s.Then.List, results, sigs)
+		if s.Else != nil {
+			s.Else = expandTryStmt(s.Else, results, sigs)[0]
+		}
+
+	case *syntax.ForStmt:
+		if s.Body != nil {
+			s.Body.List = rewriteTryBlock(s.Body.List, results, sigs)
+		}
+
+	case *syntax.SwitchStmt:
+		for _, cc := range s.Body {
+			cc.Body = rewriteTryBlock(cc.Body, results, sigs)
+		}
+
+	case *syntax.SelectStmt:
+		for _, cc := range s.Body {
+			cc.Body = rewriteTryBlock(cc.Body, results, sigs)
+		}
+
+	case *syntax.ExprStmt:
+		if pre, val := hoistTry(s.X, results, sigs); pre != nil {
+			s.X = val
+			return append(pre, s)
+		}
+
+	case *syntax.AssignStmt:
+		if s.Rhs != nil {
+			if pre, val := hoistTry(s.Rhs, results, sigs); pre != nil {
+				s.Rhs = val
+				return append(pre, s)
+			}
+		}
+
+	case *syntax.ReturnStmt:
+		if s.Results != nil {
+			if pre, val := hoistTry(s.Results, results, sigs); pre != nil {
+				s.Results = val
+				return append(pre, s)
+			}
+		}
+
+	case *syntax.DeclStmt:
+		for _, d := range s.DeclList {
+			vd, ok := d.(*syntax.VarDecl)
+			if !ok || vd.Values == nil {
+				continue
+			}
+			if pre, val := hoistTry(vd.Values, results, sigs); pre != nil {
+				vd.Values = val
+				return append(pre, s)
+			}
+		}
+	}
+	return []syntax.Stmt{stmt}
+}
+
+// hoistTry recognizes e as a bare Try call or TrySelect index expression at
+// its outermost level and, if resolvable (see rewriteTryOperator's v1
+// scope note), returns the statements that must run before e's containing
+// statement plus the expression (a temp reference) to use in e's place.
+// Returns (nil, e) when e isn't a resolvable Try expression.
+func hoistTry(e syntax.Expr, results []syntax.Expr, sigs map[string][]syntax.Expr) ([]syntax.Stmt, syntax.Expr) {
+	switch x := e.(type) {
+	case *syntax.CallExpr:
+		if x.Try {
+			return lowerTryCall(x, results, sigs, -1)
+		}
+	case *syntax.IndexExpr:
+		if x.TrySelect {
+			if call, ok := x.X.(*syntax.CallExpr); ok {
+				if idx := tryIndexValue(x.Index); idx >= 0 {
+					return lowerTryCall(call, results, sigs, idx)
+				}
+			}
+		}
+	}
+	return nil, e
+}
+
+func tryIndexValue(e syntax.Expr) int {
+	lit, ok := e.(*syntax.BasicLit)
+	if !ok || lit.Kind != syntax.IntLit {
+		return -1
+	}
+	n, err := strconv.Atoi(lit.Value)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+var tryTempSeq int
+
+func newTryTemp(pos syntax.Pos) *syntax.Name {
+	tryTempSeq++
+	return syntax.NewName(pos, fmt.Sprintf("_gppTry%d", tryTempSeq))
+}
+
+// lowerTryCall builds the temp-assignment + error-check statements for a
+// Try-marked call, and returns them alongside the temp expression that
+// should replace the call (the sole non-error result for a bare '?', or
+// the selIndex'th non-error result for '?[selIndex]').
+func lowerTryCall(call *syntax.CallExpr, enclosingResults []syntax.Expr, sigs map[string][]syntax.Expr, selIndex int) ([]syntax.Stmt, syntax.Expr) {
+	name, ok := call.Fun.(*syntax.Name)
+	if !ok {
+		return nil, call
+	}
+	callResults, ok := sigs[name.Value]
+	if !ok {
+		return nil, call
+	}
+	n := len(callResults)
+	if n < 2 || !isErrorType(callResults[n-1]) {
+		return nil, call
+	}
+	if len(enclosingResults) == 0 || !isErrorType(enclosingResults[len(enclosingResults)-1]) {
+		return nil, call
+	}
+	if selIndex < 0 {
+		if n != 2 {
+			return nil, call // ambiguous with >1 non-error result: caller must use ?[i]
+		}
+		selIndex = 0
+	} else if selIndex > n-2 {
+		return nil, call // out of range, or tried to select the error slot itself
+	}
+
+	pos := call.Pos()
+
+	temps := make([]*syntax.Name, n)
+	lhs := make([]syntax.Expr, n)
+	for i := range temps {
+		// Only the selected result and the error need a real name; every
+		// other result is discarded via the blank identifier so it doesn't
+		// trip "declared and not used".
+		if i == selIndex || i == n-1 {
+			temps[i] = newTryTemp(pos)
+		} else {
+			temps[i] = syntax.NewName(pos, "_")
+		}
+		lhs[i] = temps[i]
+	}
+	assign := &syntax.AssignStmt{Op: syntax.Def, Lhs: tryTuple(pos, lhs), Rhs: call}
+	assign.SetPos(pos)
+
+	cond := &syntax.Operation{Op: syntax.Neq, X: temps[n-1], Y: syntax.NewName(pos, "nil")}
+	cond.SetPos(pos)
+
+	retResults := make([]syntax.Expr, len(enclosingResults))
+	for i, rt := range enclosingResults[:len(enclosingResults)-1] {
+		retResults[i] = tryZero(pos, rt)
+	}
+	retResults[len(enclosingResults)-1] = temps[n-1]
+
+	ret := &syntax.ReturnStmt{Results: tryTuple(pos, retResults)}
+	ret.SetPos(pos)
+
+	then := &syntax.BlockStmt{List: []syntax.Stmt{ret}}
+	then.SetPos(pos)
+	ifStmt := &syntax.IfStmt{Cond: cond, Then: then}
+	ifStmt.SetPos(pos)
+
+	return []syntax.Stmt{assign, ifStmt}, temps[selIndex]
+}
+
+func isErrorType(t syntax.Expr) bool {
+	name, ok := t.(*syntax.Name)
+	return ok && name.Value == "error"
+}
+
+func tryTuple(pos syntax.Pos, list []syntax.Expr) syntax.Expr {
+	if len(list) == 1 {
+		return list[0]
+	}
+	le := &syntax.ListExpr{ElemList: list}
+	le.SetPos(pos)
+	return le
+}
+
+// tryZero builds *new(typ), a universal zero-value expression that works
+// for any type without needing type information (which isn't available
+// yet -- this pass runs before typecheck).
+func tryZero(pos syntax.Pos, typ syntax.Expr) syntax.Expr {
+	newCall := &syntax.CallExpr{Fun: syntax.NewName(pos, "new"), ArgList: []syntax.Expr{typ}}
+	newCall.SetPos(pos)
+	deref := &syntax.Operation{Op: syntax.Mul, X: newCall}
+	deref.SetPos(pos)
+	return deref
 }
 
 // trimFilename returns the "trimmed" filename of b, which is the

@@ -185,8 +185,8 @@ redo:
 			s.tok = _QuestionDot
 			break
 		}
-		s.bad = true
-		s.errorf("illegal character %#U", '?')
+		s.nlsemi = true
+		s.tok = _Question
 
 	case '.':
 		s.nextch()
