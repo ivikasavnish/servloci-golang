@@ -1,8 +1,92 @@
 # servloci-golang
 
-A custom fork of the Go compiler (go1.27-devel) adding two language
-extensions on top of upstream Go. Everything below the next section is
-stock upstream Go documentation.
+A custom fork of the Go compiler (go1.27-devel) adding six
+language/toolchain extensions on top of upstream Go: decorators, a
+nil-safe selector, an error-propagating call operator, format-agnostic
+serialization codegen, native gRPC codegen, and map dot-access sugar.
+Everything below the "The Go Programming Language" section is stock
+upstream Go documentation.
+
+Full write-up of each addition, with implementation details and known
+limitations: **[change book / rendered site](https://ivikasavnish.github.io/servloci-golang/)**
+(source: [`doc/servloci/`](doc/servloci/)).
+
+## Table of contents
+
+- [Install](#install)
+- [Quick example](#quick-example)
+- Additions
+  - [Decorator syntax (`@decorator`)](#decorator-syntax-decorator)
+  - [Nil-safe selector (`?.`)](#nil-safe-selector-)
+  - [Error-propagating call (`?`, `?[i]`)](#error-propagating-call--i)
+  - [Format-agnostic serialization (`@codec`)](#format-agnostic-serialization-codec)
+  - [Native gRPC services (`@rpc`)](#native-grpc-services-rpc)
+  - [Map dot-access sugar (`m.foo`)](#map-dot-access-sugar-mfoo)
+
+## Install
+
+**Prebuilt binary** (Linux AMD64), via the [`gpp`](https://github.com/ivikasavnish/gpp)
+wrapper repo:
+
+```bash
+git clone https://github.com/ivikasavnish/gpp
+cd gpp
+./install.sh
+./gpp run test_decorator_syntax.go
+```
+
+`install.sh` pulls the latest tagged release
+(`gpp-linux-amd64.tar.gz`) and drops it into `gpp/compiler`; `./gpp`
+is a thin wrapper that sets `GOROOT` and execs the real `go` binary
+inside it, so every `go` subcommand works normally (`./gpp build`,
+`./gpp test`, ...), just with these extensions available.
+
+**Note:** the latest tagged release (`v0.2.0`) predates the
+error-propagating call, `@codec`, `@rpc`, and map dot-access sugar
+additions below — it only has decorators and the nil-safe selector.
+For the full current feature set, build from source instead:
+
+```bash
+git clone https://github.com/ivikasavnish/servloci-golang
+cd servloci-golang/src
+./make.bash               # builds cmd/go + cmd/compile
+export GOROOT=$(cd .. && pwd)
+$GOROOT/bin/go run yourfile.go
+```
+
+(Iterating on the compiler itself is faster: after editing
+`src/cmd/compile/...`, `go build -o $GOROOT/pkg/tool/linux_amd64/compile cmd/compile`
+rebuilds just the compiler in a few seconds, no full `make.bash` needed.)
+
+## Quick example
+
+```go
+package main
+
+import "fmt"
+
+type Address struct{ City string }
+type User struct{ Address *Address }
+
+@timed
+func greet(name string) map[string]any {
+    r := map[string]any{"name": name}
+    r.greeting = "hello, " + name // map dot-access sugar
+    return r
+}
+
+func main() {
+    r := greet("vikas")
+    fmt.Println(r.greeting) // dot-access read too
+
+    var u *User
+    fmt.Println(u?.Address?.City) // nil-safe selector: "" not a panic
+}
+```
+
+`@timed` needs a same-package `timed(func()) func()` decorator function
+in scope — see [`test_decorator_syntax.go`](https://github.com/ivikasavnish/gpp/blob/main/test_decorator_syntax.go)
+for a working one. Each addition below has its own focused example.
 
 ## Additions
 
