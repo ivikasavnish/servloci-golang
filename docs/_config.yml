@@ -1,0 +1,5 @@
+title: servloci-golang
+description: A custom Go compiler fork adding decorators, nil-safe selector, error-propagating call, format-agnostic codec, native gRPC, and map dot-access sugar.
+theme: jekyll-theme-cayman
+markdown: kramdown
+show_downloads: false
