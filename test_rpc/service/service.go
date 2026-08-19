@@ -8,28 +8,28 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"rpcdemo/rpc"
 
-	. "rpcdemo/serde"
+	. "rpcdemo/codec"
 )
 
-@serde
+@codec
 type PlaceOrderReq struct {
 	Symbol string
 	Qty    int
 }
 
-@serde
+@codec
 type PlaceOrderResp struct {
 	OrderID string
 	Ok      bool
 }
 
-@serde
+@codec
 type Tick struct {
 	Symbol string
 	Price  float64
 }
 
-@serde
+@codec
 type WatchReq struct {
 	Symbol string
 }
@@ -85,10 +85,10 @@ func (orderServiceImpl) Chat(stream *rpc.BidiStream[Tick, Tick]) error {
 	}
 }
 
-// NewServer builds a *grpc.Server with the @serde binary codec forced
+// NewServer builds a *grpc.Server with the @codec binary codec forced
 // (no protobuf) and the generated OrderService registered on it.
 func NewServer() *grpc.Server {
-	s := grpc.NewServer(grpc.ForceServerCodec(SerdeCodec{}))
+	s := grpc.NewServer(grpc.ForceServerCodec(Codec{}))
 	RegisterOrderServiceServer(s, orderServiceImpl{})
 	return s
 }
@@ -97,7 +97,7 @@ func NewServer() *grpc.Server {
 func DialClient(addr string) (OrderServiceClient, *grpc.ClientConn, error) {
 	cc, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(SerdeCodec{})),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(Codec{})),
 	)
 	if err != nil {
 		return nil, nil, err

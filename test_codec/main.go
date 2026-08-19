@@ -2,14 +2,14 @@ package main
 
 import "fmt"
 
-@serde
+@codec
 type Address struct {
 	Street string
 	City   string
 	Zip    int
 }
 
-@serde
+@codec
 type User struct {
 	Name    string
 	Age     int
@@ -35,7 +35,7 @@ func main() {
 
 	// --- JSON round trip ---
 	je := NewJSONEncoder()
-	if err := u.SerdeEncode(je); err != nil {
+	if err := u.CodecEncode(je); err != nil {
 		panic(err)
 	}
 	jsonBytes := je.Bytes()
@@ -46,14 +46,14 @@ func main() {
 		panic(err)
 	}
 	var u2 User
-	if err := u2.SerdeDecode(jd); err != nil {
+	if err := u2.CodecDecode(jd); err != nil {
 		panic(err)
 	}
 	fmt.Printf("JSON roundtrip match: %v\n", fmt.Sprintf("%+v", u) == fmt.Sprintf("%+v", u2))
 
 	// --- Binary round trip, same struct, zero extra codegen ---
 	be := NewBinaryEncoder()
-	if err := u.SerdeEncode(be); err != nil {
+	if err := u.CodecEncode(be); err != nil {
 		panic(err)
 	}
 	binBytes := be.Bytes()
@@ -61,7 +61,7 @@ func main() {
 
 	bd := NewBinaryDecoder(binBytes)
 	var u3 User
-	if err := u3.SerdeDecode(bd); err != nil {
+	if err := u3.CodecDecode(bd); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Binary roundtrip match: %v\n", fmt.Sprintf("%+v", u) == fmt.Sprintf("%+v", u3))
@@ -69,7 +69,7 @@ func main() {
 	// --- pointer field with a value, to exercise EncodeOptional(true) path ---
 	u.Backup = &Address{Street: "2 Side St", City: "Leeds", Zip: 2000}
 	je2 := NewJSONEncoder()
-	if err := u.SerdeEncode(je2); err != nil {
+	if err := u.CodecEncode(je2); err != nil {
 		panic(err)
 	}
 	fmt.Println("JSON w/ backup:", je2.String())
@@ -78,7 +78,7 @@ func main() {
 		panic(err)
 	}
 	var u4 User
-	if err := u4.SerdeDecode(jd2); err != nil {
+	if err := u4.CodecDecode(jd2); err != nil {
 		panic(err)
 	}
 	fmt.Printf("Backup roundtrip match: %v\n", fmt.Sprintf("%+v", *u.Backup) == fmt.Sprintf("%+v", *u4.Backup))

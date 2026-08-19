@@ -78,7 +78,7 @@ func LoadPackage(filenames []string) {
 	for _, p := range noders {
 		rewriteDecorators(p.file)
 		rewriteTryOperator(p.file)
-		rewriteSerdeDecorators(p.file)
+		rewriteCodecDecorators(p.file)
 		rewriteRPCDecorators(p.file)
 	}
 
@@ -493,8 +493,8 @@ func tryZero(pos syntax.Pos, typ syntax.Expr) syntax.Expr {
 	return deref
 }
 
-// rewriteSerdeDecorators finds struct type declarations tagged @serde and
-// generates format-agnostic SerdeEncode/SerdeDecode methods for them,
+// rewriteCodecDecorators finds struct type declarations tagged @codec and
+// generates format-agnostic CodecEncode/CodecDecode methods for them,
 // spliced into the file's declaration list before typechecking.
 //
 // The generated pair walks the struct's fields against the Encoder/Decoder
@@ -518,131 +518,131 @@ func tryZero(pos syntax.Pos, typ syntax.Expr) syntax.Expr {
 //
 // v1 scope: struct types only (no generics), no embedded/anonymous
 // fields, map keys must be string. A field naming another type (e.g.
-// `Address Addr`) is assumed to be another @serde struct; if it isn't,
-// the generated `(v.Address).SerdeEncode(e)` call simply fails to compile
+// `Address Addr`) is assumed to be another @codec struct; if it isn't,
+// the generated `(v.Address).CodecEncode(e)` call simply fails to compile
 // with an ordinary "undefined method" error -- same safe-fail philosophy
 // as rewriteTryOperator's unresolvable ? usages.
-func rewriteSerdeDecorators(file *syntax.File) {
+func rewriteCodecDecorators(file *syntax.File) {
 	if file == nil {
 		return
 	}
 	var pm posMap
 	for _, decl := range file.DeclList {
 		td, ok := decl.(*syntax.TypeDecl)
-		if !ok || !hasSerdeDecorator(td.Decorators) {
+		if !ok || !hasCodecDecorator(td.Decorators) {
 			continue
 		}
 		if len(td.TParamList) > 0 {
-			base.ErrorfAt(pm.pos(td), 0, "@serde does not support generic types")
+			base.ErrorfAt(pm.pos(td), 0, "@codec does not support generic types")
 			continue
 		}
 		st, ok := td.Type.(*syntax.StructType)
 		if !ok {
-			base.ErrorfAt(pm.pos(td), 0, "@serde can only be applied to struct types")
+			base.ErrorfAt(pm.pos(td), 0, "@codec can only be applied to struct types")
 			continue
 		}
 
-		src, ok := genSerdeSource(&pm, td.Name.Value, st)
+		src, ok := genCodecSource(&pm, td.Name.Value, st)
 		if !ok {
 			continue // errors already reported at the offending fields
 		}
 
-		synthBase := syntax.NewFileBase(fmt.Sprintf("<serde:%s>", td.Name.Value))
+		synthBase := syntax.NewFileBase(fmt.Sprintf("<codec:%s>", td.Name.Value))
 		synth, err := syntax.Parse(synthBase, strings.NewReader(src), func(e error) {
-			base.Fatalf("gpp: internal error: generated @serde code for %s failed to parse: %v\n---\n%s", td.Name.Value, e, src)
+			base.Fatalf("gpp: internal error: generated @codec code for %s failed to parse: %v\n---\n%s", td.Name.Value, e, src)
 		}, nil, 0)
 		if err != nil || synth == nil {
-			base.Fatalf("gpp: internal error: generated @serde code for %s failed to parse: %v\n---\n%s", td.Name.Value, err, src)
+			base.Fatalf("gpp: internal error: generated @codec code for %s failed to parse: %v\n---\n%s", td.Name.Value, err, src)
 		}
 		file.DeclList = append(file.DeclList, synth.DeclList...)
 	}
 }
 
-func hasSerdeDecorator(decorators []*syntax.Decorator) bool {
+func hasCodecDecorator(decorators []*syntax.Decorator) bool {
 	for _, d := range decorators {
-		if d.Name != nil && d.Name.Value == "serde" {
+		if d.Name != nil && d.Name.Value == "codec" {
 			return true
 		}
 	}
 	return false
 }
 
-// serde field-type classification, decided purely from the syntax tree
+// codec field-type classification, decided purely from the syntax tree
 // (no typecheck available yet).
-type serdeKind int
+type codecKind int
 
 const (
-	serdeUnsupported serdeKind = iota
-	serdeString
-	serdeInt
-	serdeFloat
-	serdeBool
-	serdeStruct // assumed another @serde-tagged struct, named by a plain identifier
-	serdePointer
-	serdeSlice
-	serdeArray
-	serdeMap
+	codecUnsupported codecKind = iota
+	codecString
+	codecInt
+	codecFloat
+	codecBool
+	codecStruct // assumed another @codec-tagged struct, named by a plain identifier
+	codecPointer
+	codecSlice
+	codecArray
+	codecMap
 )
 
-func classifySerdeType(t syntax.Expr) (kind serdeKind, elem syntax.Expr, mapKey syntax.Expr) {
+func classifyCodecType(t syntax.Expr) (kind codecKind, elem syntax.Expr, mapKey syntax.Expr) {
 	switch x := t.(type) {
 	case *syntax.Name:
 		switch x.Value {
 		case "string":
-			return serdeString, nil, nil
+			return codecString, nil, nil
 		case "int", "int8", "int16", "int32", "int64",
 			"uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "byte", "rune":
-			return serdeInt, nil, nil
+			return codecInt, nil, nil
 		case "float32", "float64":
-			return serdeFloat, nil, nil
+			return codecFloat, nil, nil
 		case "bool":
-			return serdeBool, nil, nil
+			return codecBool, nil, nil
 		default:
-			return serdeStruct, nil, nil
+			return codecStruct, nil, nil
 		}
 	case *syntax.Operation:
 		if x.Op == syntax.Mul && x.Y == nil {
-			return serdePointer, x.X, nil
+			return codecPointer, x.X, nil
 		}
 	case *syntax.SliceType:
-		return serdeSlice, x.Elem, nil
+		return codecSlice, x.Elem, nil
 	case *syntax.ArrayType:
-		return serdeArray, x.Elem, nil
+		return codecArray, x.Elem, nil
 	case *syntax.MapType:
-		return serdeMap, x.Value, x.Key
+		return codecMap, x.Value, x.Key
 	}
-	return serdeUnsupported, nil, nil
+	return codecUnsupported, nil, nil
 }
 
-// serdeTypeString renders a field type expression back to Go source text,
+// codecTypeString renders a field type expression back to Go source text,
 // for use in the generated code (var decls, make(), conversions). Only
-// needs to handle the shapes classifySerdeType recognizes.
-func serdeTypeString(t syntax.Expr) string {
+// needs to handle the shapes classifyCodecType recognizes.
+func codecTypeString(t syntax.Expr) string {
 	switch x := t.(type) {
 	case *syntax.Name:
 		return x.Value
 	case *syntax.Operation:
 		if x.Op == syntax.Mul && x.Y == nil {
-			return "*" + serdeTypeString(x.X)
+			return "*" + codecTypeString(x.X)
 		}
 	case *syntax.SliceType:
-		return "[]" + serdeTypeString(x.Elem)
+		return "[]" + codecTypeString(x.Elem)
 	case *syntax.ArrayType:
-		return "[" + serdeTypeString(x.Len) + "]" + serdeTypeString(x.Elem)
+		return "[" + codecTypeString(x.Len) + "]" + codecTypeString(x.Elem)
 	case *syntax.MapType:
-		return "map[" + serdeTypeString(x.Key) + "]" + serdeTypeString(x.Value)
+		return "map[" + codecTypeString(x.Key) + "]" + codecTypeString(x.Value)
 	case *syntax.BasicLit:
 		return x.Value
 	}
 	return ""
 }
 
-// genSerdeSource builds the full Go source (package clause + both method
-// decls) for typeName's SerdeEncode/SerdeDecode pair. ok is false if any
+// genCodecSource builds the full Go source (package clause + both method
+// decls) for typeName's CodecEncode/CodecDecode pair. ok is false if any
 // field had an unsupported shape (already reported via base.ErrorfAt at
 // that field's position); the caller should skip codegen for this struct
 // in that case.
-func genSerdeSource(pm *posMap, typeName string, st *syntax.StructType) (string, bool) {
+func genCodecSource(pm *posMap, typeName string, st *syntax.StructType) (string, bool) {
 	var enc, dec strings.Builder
 	var fieldNames []string
 	ctr := 0
@@ -652,22 +652,22 @@ func genSerdeSource(pm *posMap, typeName string, st *syntax.StructType) (string,
 		if f.Name == nil || f.Name.Value == "_" {
 			continue // embedded/anonymous fields unsupported in v1, silently skipped like decorator-on-method
 		}
-		kind, _, mapKey := classifySerdeType(f.Type)
-		if kind == serdeUnsupported {
-			base.ErrorfAt(pm.pos(f.Type), 0, "@serde: field %s.%s has an unsupported type for serialization", typeName, f.Name.Value)
+		kind, _, mapKey := classifyCodecType(f.Type)
+		if kind == codecUnsupported {
+			base.ErrorfAt(pm.pos(f.Type), 0, "@codec: field %s.%s has an unsupported type for serialization", typeName, f.Name.Value)
 			ok = false
 			continue
 		}
-		if kind == serdeMap {
+		if kind == codecMap {
 			if ks, isName := mapKey.(*syntax.Name); !isName || ks.Value != "string" {
-				base.ErrorfAt(pm.pos(f.Type), 0, "@serde: field %s.%s: only string-keyed maps are supported", typeName, f.Name.Value)
+				base.ErrorfAt(pm.pos(f.Type), 0, "@codec: field %s.%s: only string-keyed maps are supported", typeName, f.Name.Value)
 				ok = false
 				continue
 			}
 		}
 		fieldNames = append(fieldNames, f.Name.Value)
-		writeSerdeEncodeField(&enc, "v."+f.Name.Value, f.Type, &ctr)
-		writeSerdeDecodeField(&dec, "v."+f.Name.Value, f.Type, &ctr)
+		writeCodecEncodeField(&enc, "v."+f.Name.Value, f.Type, &ctr)
+		writeCodecDecodeField(&dec, "v."+f.Name.Value, f.Type, &ctr)
 	}
 	if !ok {
 		return "", false
@@ -684,12 +684,12 @@ func genSerdeSource(pm *posMap, typeName string, st *syntax.StructType) (string,
 	namesLit.WriteString("}")
 
 	var out strings.Builder
-	fmt.Fprintf(&out, "package p\n\nfunc (v %s) SerdeEncode(e Encoder) error {\n", typeName)
+	fmt.Fprintf(&out, "package p\n\nfunc (v %s) CodecEncode(e Encoder) error {\n", typeName)
 	fmt.Fprintf(&out, "if err := e.EncodeStructStart(%q, %s); err != nil {\nreturn err\n}\n", typeName, namesLit.String())
 	out.WriteString(enc.String())
 	out.WriteString("return e.EncodeStructEnd()\n}\n\n")
 
-	fmt.Fprintf(&out, "func (v *%s) SerdeDecode(d Decoder) error {\n", typeName)
+	fmt.Fprintf(&out, "func (v *%s) CodecDecode(d Decoder) error {\n", typeName)
 	fmt.Fprintf(&out, "if err := d.DecodeStructStart(%q, %s); err != nil {\nreturn err\n}\n", typeName, namesLit.String())
 	out.WriteString(dec.String())
 	out.WriteString("return d.DecodeStructEnd()\n}\n")
@@ -697,97 +697,97 @@ func genSerdeSource(pm *posMap, typeName string, st *syntax.StructType) (string,
 	return out.String(), true
 }
 
-// writeSerdeEncodeField emits statements that encode the Go expression
+// writeCodecEncodeField emits statements that encode the Go expression
 // expr (of type t) via e, appending to w. Recurses for pointer/slice/
 // array/map element types.
-func writeSerdeEncodeField(w *strings.Builder, expr string, t syntax.Expr, ctr *int) {
-	kind, elem, _ := classifySerdeType(t)
+func writeCodecEncodeField(w *strings.Builder, expr string, t syntax.Expr, ctr *int) {
+	kind, elem, _ := classifyCodecType(t)
 	switch kind {
-	case serdeString:
+	case codecString:
 		fmt.Fprintf(w, "if err := e.EncodeString(%s); err != nil {\nreturn err\n}\n", expr)
-	case serdeInt:
+	case codecInt:
 		fmt.Fprintf(w, "if err := e.EncodeInt(int64(%s)); err != nil {\nreturn err\n}\n", expr)
-	case serdeFloat:
+	case codecFloat:
 		fmt.Fprintf(w, "if err := e.EncodeFloat(float64(%s)); err != nil {\nreturn err\n}\n", expr)
-	case serdeBool:
+	case codecBool:
 		fmt.Fprintf(w, "if err := e.EncodeBool(%s); err != nil {\nreturn err\n}\n", expr)
-	case serdeStruct:
-		fmt.Fprintf(w, "if err := (%s).SerdeEncode(e); err != nil {\nreturn err\n}\n", expr)
-	case serdePointer:
+	case codecStruct:
+		fmt.Fprintf(w, "if err := (%s).CodecEncode(e); err != nil {\nreturn err\n}\n", expr)
+	case codecPointer:
 		fmt.Fprintf(w, "if %s == nil {\nif err := e.EncodeOptional(false); err != nil {\nreturn err\n}\n} else {\nif err := e.EncodeOptional(true); err != nil {\nreturn err\n}\n", expr)
-		writeSerdeEncodeField(w, "(*"+expr+")", elem, ctr)
+		writeCodecEncodeField(w, "(*"+expr+")", elem, ctr)
 		w.WriteString("}\n")
-	case serdeSlice, serdeArray:
+	case codecSlice, codecArray:
 		*ctr++
 		ev := fmt.Sprintf("_gppElem%d", *ctr)
 		fmt.Fprintf(w, "if err := e.EncodeSeqStart(len(%s)); err != nil {\nreturn err\n}\nfor _, %s := range %s {\n", expr, ev, expr)
-		writeSerdeEncodeField(w, ev, elem, ctr)
+		writeCodecEncodeField(w, ev, elem, ctr)
 		w.WriteString("}\n")
 		w.WriteString("if err := e.EncodeSeqEnd(); err != nil {\nreturn err\n}\n")
-	case serdeMap:
+	case codecMap:
 		*ctr++
 		kv := fmt.Sprintf("_gppKey%d", *ctr)
 		vv := fmt.Sprintf("_gppVal%d", *ctr)
 		fmt.Fprintf(w, "if err := e.EncodeMapStart(len(%s)); err != nil {\nreturn err\n}\nfor %s, %s := range %s {\nif err := e.EncodeString(%s); err != nil {\nreturn err\n}\n", expr, kv, vv, expr, kv)
-		writeSerdeEncodeField(w, vv, elem, ctr)
+		writeCodecEncodeField(w, vv, elem, ctr)
 		w.WriteString("}\n")
 		w.WriteString("if err := e.EncodeMapEnd(); err != nil {\nreturn err\n}\n")
 	}
 }
 
-// writeSerdeDecodeField emits statements that decode a value of type t
+// writeCodecDecodeField emits statements that decode a value of type t
 // from d into the assignable Go expression target, appending to w.
-func writeSerdeDecodeField(w *strings.Builder, target string, t syntax.Expr, ctr *int) {
-	kind, elem, _ := classifySerdeType(t)
+func writeCodecDecodeField(w *strings.Builder, target string, t syntax.Expr, ctr *int) {
+	kind, elem, _ := classifyCodecType(t)
 	*ctr++
 	switch kind {
-	case serdeString:
+	case codecString:
 		tmp := fmt.Sprintf("_gppDec%d", *ctr)
 		fmt.Fprintf(w, "%s, err := d.DecodeString()\nif err != nil {\nreturn err\n}\n%s = %s\n", tmp, target, tmp)
-	case serdeInt:
+	case codecInt:
 		tmp := fmt.Sprintf("_gppDec%d", *ctr)
-		fmt.Fprintf(w, "%s, err := d.DecodeInt()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, serdeTypeString(t), tmp)
-	case serdeFloat:
+		fmt.Fprintf(w, "%s, err := d.DecodeInt()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, codecTypeString(t), tmp)
+	case codecFloat:
 		tmp := fmt.Sprintf("_gppDec%d", *ctr)
-		fmt.Fprintf(w, "%s, err := d.DecodeFloat()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, serdeTypeString(t), tmp)
-	case serdeBool:
+		fmt.Fprintf(w, "%s, err := d.DecodeFloat()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, codecTypeString(t), tmp)
+	case codecBool:
 		tmp := fmt.Sprintf("_gppDec%d", *ctr)
 		fmt.Fprintf(w, "%s, err := d.DecodeBool()\nif err != nil {\nreturn err\n}\n%s = %s\n", tmp, target, tmp)
-	case serdeStruct:
-		fmt.Fprintf(w, "if err := (&%s).SerdeDecode(d); err != nil {\nreturn err\n}\n", target)
-	case serdePointer:
+	case codecStruct:
+		fmt.Fprintf(w, "if err := (&%s).CodecDecode(d); err != nil {\nreturn err\n}\n", target)
+	case codecPointer:
 		present := fmt.Sprintf("_gppPresent%d", *ctr)
 		tmp := fmt.Sprintf("_gppPtr%d", *ctr)
-		typ := serdeTypeString(elem)
+		typ := codecTypeString(elem)
 		fmt.Fprintf(w, "%s, err := d.DecodeOptional()\nif err != nil {\nreturn err\n}\nif %s {\nvar %s %s\n", present, present, tmp, typ)
-		writeSerdeDecodeField(w, tmp, elem, ctr)
+		writeCodecDecodeField(w, tmp, elem, ctr)
 		fmt.Fprintf(w, "%s = &%s\n} else {\n%s = nil\n}\n", target, tmp, target)
-	case serdeSlice:
+	case codecSlice:
 		n := fmt.Sprintf("_gppN%d", *ctr)
 		sl := fmt.Sprintf("_gppSl%d", *ctr)
 		ev := fmt.Sprintf("_gppSE%d", *ctr)
-		typ := serdeTypeString(elem)
+		typ := codecTypeString(elem)
 		fmt.Fprintf(w, "%s, err := d.DecodeSeqStart()\nif err != nil {\nreturn err\n}\n%s := make([]%s, %s)\nfor i := 0; i < %s; i++ {\nvar %s %s\n", n, sl, typ, n, n, ev, typ)
-		writeSerdeDecodeField(w, ev, elem, ctr)
+		writeCodecDecodeField(w, ev, elem, ctr)
 		fmt.Fprintf(w, "%s[i] = %s\n}\n", sl, ev)
 		fmt.Fprintf(w, "if err := d.DecodeSeqEnd(); err != nil {\nreturn err\n}\n%s = %s\n", target, sl)
-	case serdeArray:
+	case codecArray:
 		n := fmt.Sprintf("_gppN%d", *ctr)
 		sl := fmt.Sprintf("_gppSl%d", *ctr)
 		ev := fmt.Sprintf("_gppSE%d", *ctr)
-		typ := serdeTypeString(elem)
+		typ := codecTypeString(elem)
 		fmt.Fprintf(w, "%s, err := d.DecodeSeqStart()\nif err != nil {\nreturn err\n}\n%s := make([]%s, %s)\nfor i := 0; i < %s; i++ {\nvar %s %s\n", n, sl, typ, n, n, ev, typ)
-		writeSerdeDecodeField(w, ev, elem, ctr)
+		writeCodecDecodeField(w, ev, elem, ctr)
 		fmt.Fprintf(w, "%s[i] = %s\n}\n", sl, ev)
 		fmt.Fprintf(w, "if err := d.DecodeSeqEnd(); err != nil {\nreturn err\n}\ncopy(%s[:], %s)\n", target, sl)
-	case serdeMap:
+	case codecMap:
 		n := fmt.Sprintf("_gppN%d", *ctr)
 		mp := fmt.Sprintf("_gppMp%d", *ctr)
 		kv := fmt.Sprintf("_gppMk%d", *ctr)
 		vv := fmt.Sprintf("_gppMv%d", *ctr)
-		typ := serdeTypeString(elem)
+		typ := codecTypeString(elem)
 		fmt.Fprintf(w, "%s, err := d.DecodeMapStart()\nif err != nil {\nreturn err\n}\n%s := make(map[string]%s, %s)\nfor i := 0; i < %s; i++ {\n%s, err := d.DecodeString()\nif err != nil {\nreturn err\n}\nvar %s %s\n", n, mp, typ, n, n, kv, vv, typ)
-		writeSerdeDecodeField(w, vv, elem, ctr)
+		writeCodecDecodeField(w, vv, elem, ctr)
 		fmt.Fprintf(w, "%s[%s] = %s\n}\n", mp, kv, vv)
 		fmt.Fprintf(w, "if err := d.DecodeMapEnd(); err != nil {\nreturn err\n}\n%s = %s\n", target, mp)
 	}
@@ -797,16 +797,16 @@ func writeSerdeDecodeField(w *strings.Builder, target string, t syntax.Expr, ctr
 // generates a real gRPC client + server (ServiceDesc, handlers,
 // Register...Server) for them -- no .proto file, no protoc, no generated
 // _pb.go. The interface itself is the service definition (server-side
-// contract); request/response types are expected to be @serde structs.
+// contract); request/response types are expected to be @codec structs.
 //
-// Wire format is gRPC's pluggable encoding.Codec (serde.SerdeCodec, in the
+// Wire format is gRPC's pluggable encoding.Codec (codec.Codec, in the
 // runtime library) instead of protobuf -- real gRPC transport (HTTP/2,
 // deadlines, interceptors, all four streaming shapes) with zero protobuf.
 // This means it only interoperates with other gpp-compiled services, not
 // arbitrary protoc-generated clients in other languages -- a deliberate
 // v1 scope choice, not an oversight.
 //
-// Same reparse-generated-source-text approach as rewriteSerdeDecorators,
+// Same reparse-generated-source-text approach as rewriteCodecDecorators,
 // for the same reason: far fewer places to get an AST node shape wrong
 // across four different method shapes (unary + 3 streaming variants) than
 // hand-building every statement node.
@@ -873,7 +873,7 @@ type rpcMethod struct {
 }
 
 // unwrapPointer reports whether t is *X (written as a prefix-* Operation,
-// the same shape classifySerdeType/tryZero already deal with), returning X.
+// the same shape classifyCodecType/tryZero already deal with), returning X.
 func unwrapPointer(t syntax.Expr) (syntax.Expr, bool) {
 	op, ok := t.(*syntax.Operation)
 	if !ok || op.Op != syntax.Mul || op.Y != nil {
@@ -1076,7 +1076,7 @@ func genRPCSource(pm *posMap, ifaceName string, methodFields []*syntax.Field) (s
 	// @rpc interface, which (to have typechecked at all) must already
 	// import "context", "google.golang.org/grpc" as grpc, and its stream
 	// runtime package as rpc -- re-importing the same paths here would be
-	// a duplicate-import error. Same convention as @serde's bare
+	// a duplicate-import error. Same convention as @codec's bare
 	// Encoder/Decoder: required identifiers must already be in scope.
 	var out strings.Builder
 	out.WriteString("package p\n\n")

@@ -1,4 +1,4 @@
-package serde
+package codec
 
 import (
 	"bytes"
@@ -198,7 +198,7 @@ func NewJSONDecoder(data []byte) (*JSONDecoder, error) {
 		return nil, err
 	}
 	if len(bytes.TrimSpace(rest)) != 0 {
-		return nil, errors.New("serde: trailing data after JSON value")
+		return nil, errors.New("codec: trailing data after JSON value")
 	}
 	return &JSONDecoder{next: v}, nil
 }
@@ -221,14 +221,14 @@ func (d *JSONDecoder) take() (any, error) {
 	switch f.kind {
 	case 's':
 		if f.idx >= len(f.fields) {
-			return nil, fmt.Errorf("serde: no more fields in struct")
+			return nil, fmt.Errorf("codec: no more fields in struct")
 		}
 		v := f.mapVal[f.fields[f.idx]]
 		f.idx++
 		return v, nil
 	case 'q':
 		if f.idx >= len(f.seq) {
-			return nil, fmt.Errorf("serde: sequence exhausted")
+			return nil, fmt.Errorf("codec: sequence exhausted")
 		}
 		v := f.seq[f.idx]
 		f.idx++
@@ -237,7 +237,7 @@ func (d *JSONDecoder) take() (any, error) {
 		// alternating key/value; key calls come through EncodeString-shaped
 		// DecodeString, values through the element decoder.
 		if f.idx >= len(f.mapKeys) {
-			return nil, fmt.Errorf("serde: map exhausted")
+			return nil, fmt.Errorf("codec: map exhausted")
 		}
 		if !f.expectValue {
 			k := f.mapKeys[f.idx]
@@ -249,7 +249,7 @@ func (d *JSONDecoder) take() (any, error) {
 		f.expectValue = false
 		return f.mapVal[k], nil
 	}
-	return nil, errors.New("serde: internal decoder state error")
+	return nil, errors.New("codec: internal decoder state error")
 }
 
 func (d *JSONDecoder) DecodeString() (string, error) {
@@ -259,7 +259,7 @@ func (d *JSONDecoder) DecodeString() (string, error) {
 	}
 	s, ok := v.(string)
 	if !ok {
-		return "", fmt.Errorf("serde: expected string, got %T", v)
+		return "", fmt.Errorf("codec: expected string, got %T", v)
 	}
 	return s, nil
 }
@@ -271,7 +271,7 @@ func (d *JSONDecoder) DecodeInt() (int64, error) {
 	}
 	f, ok := v.(float64)
 	if !ok {
-		return 0, fmt.Errorf("serde: expected number, got %T", v)
+		return 0, fmt.Errorf("codec: expected number, got %T", v)
 	}
 	return int64(f), nil
 }
@@ -283,7 +283,7 @@ func (d *JSONDecoder) DecodeFloat() (float64, error) {
 	}
 	f, ok := v.(float64)
 	if !ok {
-		return 0, fmt.Errorf("serde: expected number, got %T", v)
+		return 0, fmt.Errorf("codec: expected number, got %T", v)
 	}
 	return f, nil
 }
@@ -295,7 +295,7 @@ func (d *JSONDecoder) DecodeBool() (bool, error) {
 	}
 	b, ok := v.(bool)
 	if !ok {
-		return false, fmt.Errorf("serde: expected bool, got %T", v)
+		return false, fmt.Errorf("codec: expected bool, got %T", v)
 	}
 	return b, nil
 }
@@ -339,7 +339,7 @@ func (d *JSONDecoder) DecodeStructStart(name string, fieldNames []string) error 
 	}
 	m, ok := v.(map[string]any)
 	if !ok {
-		return fmt.Errorf("serde: expected object for %s, got %T", name, v)
+		return fmt.Errorf("codec: expected object for %s, got %T", name, v)
 	}
 	d.stack = append(d.stack, &jsonDecFrame{kind: 's', fields: fieldNames, mapVal: m})
 	return nil
@@ -357,7 +357,7 @@ func (d *JSONDecoder) DecodeSeqStart() (int, error) {
 	}
 	s, ok := v.([]any)
 	if !ok {
-		return 0, fmt.Errorf("serde: expected array, got %T", v)
+		return 0, fmt.Errorf("codec: expected array, got %T", v)
 	}
 	d.stack = append(d.stack, &jsonDecFrame{kind: 'q', seq: s})
 	return len(s), nil
@@ -375,7 +375,7 @@ func (d *JSONDecoder) DecodeMapStart() (int, error) {
 	}
 	m, ok := v.(map[string]any)
 	if !ok {
-		return 0, fmt.Errorf("serde: expected object, got %T", v)
+		return 0, fmt.Errorf("codec: expected object, got %T", v)
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -395,7 +395,7 @@ func (d *JSONDecoder) DecodeMapEnd() error {
 func parseJSONValue(b []byte) (any, []byte, error) {
 	b = skipSpace(b)
 	if len(b) == 0 {
-		return nil, nil, errors.New("serde: unexpected end of JSON")
+		return nil, nil, errors.New("codec: unexpected end of JSON")
 	}
 	switch b[0] {
 	case '{':
@@ -438,7 +438,7 @@ func parseJSONObject(b []byte) (any, []byte, error) {
 	for {
 		b = skipSpace(b)
 		if len(b) == 0 || b[0] != '"' {
-			return nil, nil, errors.New("serde: expected object key")
+			return nil, nil, errors.New("codec: expected object key")
 		}
 		key, rest, err := parseJSONStringLit(b)
 		if err != nil {
@@ -446,7 +446,7 @@ func parseJSONObject(b []byte) (any, []byte, error) {
 		}
 		b = skipSpace(rest)
 		if len(b) == 0 || b[0] != ':' {
-			return nil, nil, errors.New("serde: expected ':' in object")
+			return nil, nil, errors.New("codec: expected ':' in object")
 		}
 		b = b[1:]
 		val, rest2, err := parseJSONValue(b)
@@ -456,7 +456,7 @@ func parseJSONObject(b []byte) (any, []byte, error) {
 		m[key.(string)] = val
 		b = skipSpace(rest2)
 		if len(b) == 0 {
-			return nil, nil, errors.New("serde: unterminated object")
+			return nil, nil, errors.New("codec: unterminated object")
 		}
 		if b[0] == ',' {
 			b = b[1:]
@@ -465,7 +465,7 @@ func parseJSONObject(b []byte) (any, []byte, error) {
 		if b[0] == '}' {
 			return m, b[1:], nil
 		}
-		return nil, nil, errors.New("serde: expected ',' or '}' in object")
+		return nil, nil, errors.New("codec: expected ',' or '}' in object")
 	}
 }
 
@@ -484,7 +484,7 @@ func parseJSONArray(b []byte) (any, []byte, error) {
 		arr = append(arr, val)
 		b = skipSpace(rest)
 		if len(b) == 0 {
-			return nil, nil, errors.New("serde: unterminated array")
+			return nil, nil, errors.New("codec: unterminated array")
 		}
 		if b[0] == ',' {
 			b = b[1:]
@@ -493,7 +493,7 @@ func parseJSONArray(b []byte) (any, []byte, error) {
 		if b[0] == ']' {
 			return arr, b[1:], nil
 		}
-		return nil, nil, errors.New("serde: expected ',' or ']' in array")
+		return nil, nil, errors.New("codec: expected ',' or ']' in array")
 	}
 }
 
@@ -507,7 +507,7 @@ func parseJSONStringLit(b []byte) (any, []byte, error) {
 		}
 		if c == '\\' {
 			if len(b) < 2 {
-				return nil, nil, errors.New("serde: unterminated escape")
+				return nil, nil, errors.New("codec: unterminated escape")
 			}
 			switch b[1] {
 			case '"':
@@ -524,7 +524,7 @@ func parseJSONStringLit(b []byte) (any, []byte, error) {
 				out = append(out, '\r')
 			case 'u':
 				if len(b) < 6 {
-					return nil, nil, errors.New("serde: bad \\u escape")
+					return nil, nil, errors.New("codec: bad \\u escape")
 				}
 				n, err := strconv.ParseUint(string(b[2:6]), 16, 32)
 				if err != nil {
@@ -536,7 +536,7 @@ func parseJSONStringLit(b []byte) (any, []byte, error) {
 				b = b[6:]
 				continue
 			default:
-				return nil, nil, fmt.Errorf("serde: bad escape \\%c", b[1])
+				return nil, nil, fmt.Errorf("codec: bad escape \\%c", b[1])
 			}
 			b = b[2:]
 			continue
@@ -544,7 +544,7 @@ func parseJSONStringLit(b []byte) (any, []byte, error) {
 		out = append(out, c)
 		b = b[1:]
 	}
-	return nil, nil, errors.New("serde: unterminated string")
+	return nil, nil, errors.New("codec: unterminated string")
 }
 
 func parseJSONNumber(b []byte) (any, []byte, error) {
@@ -553,7 +553,7 @@ func parseJSONNumber(b []byte) (any, []byte, error) {
 		i++
 	}
 	if i == 0 {
-		return nil, nil, fmt.Errorf("serde: unexpected character %q", b[0])
+		return nil, nil, fmt.Errorf("codec: unexpected character %q", b[0])
 	}
 	f, err := strconv.ParseFloat(string(b[:i]), 64)
 	if err != nil {

@@ -102,7 +102,7 @@ post-`?` result type) and lowered post-typecheck in `walk`, mirroring how
 `?.` is done — a substantially bigger change, not yet implemented. See
 `test_try_operator.go`.
 
-### Format-agnostic serialization (`@serde`)
+### Format-agnostic serialization (`@codec`)
 
 Rust-serde-style codegen, adapted to Go: one generated method pair per
 struct, decoupled from any specific wire format via two small interfaces
@@ -110,7 +110,7 @@ struct, decoupled from any specific wire format via two small interfaces
 same-package convention as `@timed`/`@logged`):
 
 ```go
-@serde
+@codec
 type User struct {
     Name string
     Age  int
@@ -118,18 +118,18 @@ type User struct {
 }
 ```
 
-generates real `SerdeEncode(Encoder) error` / `SerdeDecode(Decoder) error`
+generates real `CodecEncode(Encoder) error` / `CodecDecode(Decoder) error`
 methods on `User`, dispatched per field from the field's *syntax* shape
 (string/int/float/bool, `*T`, `[]T`/`[N]T`, `map[string]T`, or an assumed
-nested `@serde` struct) — no reflection. Both methods work against *any*
+nested `@codec` struct) — no reflection. Both methods work against *any*
 backend implementing the two interfaces: a `JSONEncoder`/`JSONDecoder` and
 a length-prefixed positional `BinaryEncoder`/`BinaryDecoder` (a minimal
 wire protocol for talking between your own services) ship as plain Go in
-`test_serde/`, and adding a third format later — YAML, MessagePack, a
+`test_codec/`, and adding a third format later — YAML, MessagePack, a
 different wire protocol — costs zero new codegen: just implement the
 interface once.
 
-Rewritten pre-typecheck (`noder.rewriteSerdeDecorators`), but unlike the
+Rewritten pre-typecheck (`noder.rewriteCodecDecorators`), but unlike the
 other two features, the generated method bodies are assembled as Go
 *source text* and reparsed with `syntax.Parse` into a synthetic file
 whose declarations get spliced into the real one — far less error-prone
@@ -137,12 +137,12 @@ than hand-building dozens of statement/expression AST node types for
 every field-type shape. A field type this pass can't handle (channels,
 funcs, `interface{}`, non-string map keys) is a real compile error at
 that field's position; a field naming another type is assumed to be
-another `@serde` struct, and if it isn't, the generated
-`(v.Field).SerdeEncode(e)` call simply fails to compile with an ordinary
+another `@codec` struct, and if it isn't, the generated
+`(v.Field).CodecEncode(e)` call simply fails to compile with an ordinary
 "undefined method" error (position points at the generated code, not the
 field — a known rough edge of the reparse approach) rather than silently
-dropping the field. See `test_serde/` (`serde.go` for the interfaces,
-`serde_json.go` / `serde_binary.go` for the two backends, `main.go` for a
+dropping the field. See `test_codec/` (`codec.go` for the interfaces,
+`codec_json.go` / `codec_binary.go` for the two backends, `main.go` for a
 full round-trip demo including nested structs, slices, maps, and
 pointers).
 
@@ -165,20 +165,20 @@ type OrderService interface {
 }
 ```
 
-`noder.rewriteRPCDecorators` (also reparse-generated, like `@serde`)
+`noder.rewriteRPCDecorators` (also reparse-generated, like `@codec`)
 pattern-matches each method against the four gRPC shapes — unary,
 server-streaming, client-streaming, bidi — purely from the syntax tree,
 and generates a client type (`OrderServiceClient` /
 `NewOrderServiceClient`), a `grpc.ServiceDesc` with per-method handlers,
 and `RegisterOrderServiceServer`. `PlaceOrderReq`/`Tick`/etc are ordinary
-`@serde` structs. `ServerStream[T]`/`ClientStream[T]`/`BidiStream[Req,
+`@codec` structs. `ServerStream[T]`/`ClientStream[T]`/`BidiStream[Req,
 Resp]` (plus the client-side `ClientRecvStream`/`ClientSendStream`/
 `ClientBidiStream`) are four **generic** wrapper types in a small runtime
 package (`test_rpc/rpc/`), written once, reused for every method and
 every message type — codegen never needs a new stream type per method.
 
-Wire format is gRPC's pluggable `encoding.Codec`, backed by `@serde`'s
-binary encoder (`serde.SerdeCodec`) instead of protobuf — set via
+Wire format is gRPC's pluggable `encoding.Codec`, backed by `@codec`'s
+binary encoder (`codec.Codec`) instead of protobuf — set via
 `grpc.ForceServerCodec`/`grpc.ForceCodec`. **Deliberate v1 tradeoff:**
 this only interoperates with other gpp-compiled services, not arbitrary
 protoc-generated clients in other languages — true protobuf wire compat

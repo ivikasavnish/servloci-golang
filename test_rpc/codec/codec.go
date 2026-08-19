@@ -1,10 +1,10 @@
-// Package serde is the format-agnostic serialization runtime that @serde
-// codegen (gpp's noder.rewriteSerdeDecorators) targets. One generated
-// SerdeEncode/SerdeDecode method pair per struct works against any backend
+// Package codec is the format-agnostic serialization runtime that @codec
+// codegen (gpp's noder.rewriteCodecDecorators) targets. One generated
+// CodecEncode/CodecDecode method pair per struct works against any backend
 // implementing Encoder/Decoder -- JSONEncoder/JSONDecoder and
-// BinaryEncoder/BinaryDecoder ship here, and SerdeCodec adapts the binary
+// BinaryEncoder/BinaryDecoder ship here, and Codec adapts the binary
 // backend to gRPC's encoding.Codec interface for @rpc services.
-package serde
+package codec
 
 import "fmt"
 
@@ -36,35 +36,35 @@ type Decoder interface {
 	DecodeMapEnd() error
 }
 
-type Encodable interface{ SerdeEncode(Encoder) error }
-type Decodable interface{ SerdeDecode(Decoder) error }
+type Encodable interface{ CodecEncode(Encoder) error }
+type Decodable interface{ CodecDecode(Decoder) error }
 
-// SerdeCodec adapts the binary Encoder/Decoder backend to gRPC's
+// Codec adapts the binary Encoder/Decoder backend to gRPC's
 // encoding.Codec interface (Marshal/Unmarshal/Name), so a plain Go
 // interface tagged @rpc gets real gRPC transport (HTTP/2, deadlines,
-// interceptors, streaming) without protobuf or .proto files. Every @serde
+// interceptors, streaming) without protobuf or .proto files. Every @codec
 // message type is automatically usable this way -- no extra codegen.
-type SerdeCodec struct{}
+type Codec struct{}
 
-func (SerdeCodec) Name() string { return "serde" }
+func (Codec) Name() string { return "codec" }
 
-func (SerdeCodec) Marshal(v any) ([]byte, error) {
+func (Codec) Marshal(v any) ([]byte, error) {
 	enc, ok := v.(Encodable)
 	if !ok {
-		return nil, fmt.Errorf("serde: %T does not implement Encodable (missing SerdeEncode; did you forget @serde?)", v)
+		return nil, fmt.Errorf("codec: %T does not implement Encodable (missing CodecEncode; did you forget @codec?)", v)
 	}
 	e := NewBinaryEncoder()
-	if err := enc.SerdeEncode(e); err != nil {
+	if err := enc.CodecEncode(e); err != nil {
 		return nil, err
 	}
 	return e.Bytes(), nil
 }
 
-func (SerdeCodec) Unmarshal(data []byte, v any) error {
+func (Codec) Unmarshal(data []byte, v any) error {
 	dec, ok := v.(Decodable)
 	if !ok {
-		return fmt.Errorf("serde: %T does not implement Decodable (missing SerdeDecode; did you forget @serde?)", v)
+		return fmt.Errorf("codec: %T does not implement Decodable (missing CodecDecode; did you forget @codec?)", v)
 	}
 	d := NewBinaryDecoder(data)
-	return dec.SerdeDecode(d)
+	return dec.CodecDecode(d)
 }

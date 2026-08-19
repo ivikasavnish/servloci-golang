@@ -1,4 +1,4 @@
-package serde
+package codec
 
 import (
 	"bytes"
@@ -10,7 +10,7 @@ import (
 
 // BinaryEncoder is a compact, length-prefixed, positional wire format:
 // field/map key names are never written (both sides are compiled from the
-// same struct, so declaration order is the schema). Every @serde struct
+// same struct, so declaration order is the schema). Every @codec struct
 // gets this backend for free -- no extra codegen.
 type BinaryEncoder struct {
 	buf bytes.Buffer
@@ -76,7 +76,7 @@ func NewBinaryDecoder(data []byte) *BinaryDecoder { return &BinaryDecoder{data: 
 func (d *BinaryDecoder) getUvarint() (uint64, error) {
 	n, k := binary.Uvarint(d.data[d.pos:])
 	if k <= 0 {
-		return 0, errors.New("serde: bad varint")
+		return 0, errors.New("codec: bad varint")
 	}
 	d.pos += k
 	return n, nil
@@ -98,7 +98,7 @@ func (d *BinaryDecoder) DecodeString() (string, error) {
 func (d *BinaryDecoder) DecodeInt() (int64, error) {
 	n, k := binary.Varint(d.data[d.pos:])
 	if k <= 0 {
-		return 0, errors.New("serde: bad varint")
+		return 0, errors.New("codec: bad varint")
 	}
 	d.pos += k
 	return n, nil

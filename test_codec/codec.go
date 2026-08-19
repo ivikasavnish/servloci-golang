@@ -1,7 +1,7 @@
 package main
 
-// Encoder/Decoder are the format-agnostic interfaces @serde-generated
-// SerdeEncode/SerdeDecode methods talk to. One generated method pair per
+// Encoder/Decoder are the format-agnostic interfaces @codec-generated
+// CodecEncode/CodecDecode methods talk to. One generated method pair per
 // struct works with any backend implementing these -- JSON, a binary wire
 // format, YAML, whatever -- without regenerating anything.
 type Encoder interface {
