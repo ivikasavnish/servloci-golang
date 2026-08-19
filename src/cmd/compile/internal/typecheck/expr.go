@@ -508,6 +508,15 @@ func tcDot(n *ir.SelectorExpr, top int) ir.Node {
 	}
 
 	if Lookdot(n, t, 0) == nil {
+		// Map dot-access sugar: m.foo desugars to m["foo"] when m is a
+		// map with string keys and has no real field/method named foo.
+		// Falls through to the normal undefined-selector error below for
+		// any other base type, so struct/interface selectors are unaffected.
+		if t.IsMap() && t.Key() != nil && t.Key().Kind() == types.TSTRING {
+			key := ir.NewString(n.Pos(), n.Sel.Name)
+			return Expr(ir.NewIndexExpr(n.Pos(), n.X, key))
+		}
+
 		// Legitimate field or method lookup failed, try to explain the error
 		switch {
 		case t.IsEmptyInterface():

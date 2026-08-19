@@ -1882,6 +1882,26 @@ func (w *writer) expr(expr syntax.Expr) {
 		w.funcLit(expr)
 
 	case *syntax.SelectorExpr:
+		if expr.MapDot {
+			// Map dot-access sugar: m.foo was resolved by types2 as
+			// m["foo"] (see types2.(*Checker).selector). Emit it as a
+			// plain index expression; there is no real Selection to
+			// look up for a synthesized map key.
+			xtyp := w.p.typeOf(expr.X)
+			mapType, ok := types2.CoreType(xtyp).(*types2.Map)
+			assert(ok)
+
+			w.Code(exprIndex)
+			w.expr(expr.X)
+			w.pos(expr)
+			w.Code(exprConst)
+			w.pos(expr)
+			w.typ(mapType.Key())
+			w.Value(constant.MakeString(expr.Sel.Value))
+			w.rtype(xtyp)
+			return
+		}
+
 		sel, ok := w.p.info.Selections[expr]
 		assert(ok)
 

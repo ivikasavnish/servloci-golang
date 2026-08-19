@@ -197,6 +197,44 @@ the service, `main.go` dials a real listener and exercises all four
 shapes) — it's its own Go module (`go.mod`) since it pulls in real
 `google.golang.org/grpc`.
 
+### Map dot-access sugar (`m.foo`)
+
+`m.foo` on a map with string-kind keys desugars to `m["foo"]`, both as a
+read and as an assignment target:
+
+```go
+r := map[string]any{"name": "vikas"}
+fmt.Println(r.name)   // "vikas"
+r.city = "blr"         // same as r["city"] = "blr"
+fmt.Println(r.missing) // nil -- zero value, same as normal map index
+```
+
+Real fields and methods always win: a named map type with a `Sum()`
+method or a real struct field of the same name is resolved normally,
+never shadowed by the sugar. Nested maps chain (`nested.user.name`), and
+named string key types (`type Key string; map[Key]V`) work too.
+
+Unlike the other additions above, this isn't a pre-typecheck source
+rewrite -- it can't be, since deciding whether `m.foo` means "map key" or
+"undefined field" requires knowing `m`'s type, which isn't available
+until the real type-checker runs. So it's implemented in
+`types2.(*Checker).selector` (`src/cmd/compile/internal/types2/call.go`):
+when normal field/method lookup fails and the base type's underlying
+type is a map with a string-kind key, it resolves the selector as the
+map's element type instead of erroring, and flags the syntax node
+(`SelectorExpr.MapDot`, new field alongside the existing `NilSafe`).
+`noder/writer.go` checks that flag and emits a plain index expression
+(`exprIndex` + a synthesized string constant for the key) instead of the
+usual field-selection bytecode, since there's no real `types2.Selection`
+to record for a synthesized key. No parser or gofmt changes needed --
+`.` is already valid syntax, only its type-checking meaning changes.
+
+**Known gap:** a typo (`r.nmae`) silently returns the zero value instead
+of erroring, same footgun as raw map indexing -- not new, but sugar
+makes it easier to typo a field-like name by accident. A linter pass
+against known map-literal keys would be the place to catch that, not the
+compiler.
+
 ---
 
 # The Go Programming Language

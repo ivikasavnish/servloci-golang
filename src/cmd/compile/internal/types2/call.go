@@ -844,6 +844,19 @@ func (check *Checker) selector(x *operand, e *syntax.SelectorExpr, wantType bool
 			goto Error
 		}
 
+		// Map dot-access sugar: m.foo desugars to m["foo"] when m is a
+		// map with string-kind keys and has no real field/method named
+		// foo (checked above). e.MapDot flags the node for noder/writer
+		// to emit an index expression instead of a field selection.
+		if x.mode() != typexpr {
+			if mt, ok := x.typ().Underlying().(*Map); ok && isString(mt.Key()) {
+				x.mode_ = variable
+				x.typ_ = mt.Elem()
+				e.MapDot = true
+				return
+			}
+		}
+
 		var why string
 		if isInterfacePtr(x.typ()) {
 			why = check.interfacePtrError(x.typ())

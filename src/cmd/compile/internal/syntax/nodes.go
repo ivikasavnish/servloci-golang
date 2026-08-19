@@ -202,6 +202,7 @@ type (
 		X       Expr
 		Sel     *Name
 		NilSafe bool // true if using ?. operator
+		MapDot  bool // true if X.Sel resolved as map-key sugar (m.foo -> m["foo"]); set by types2, not the parser
 		expr
 	}
 
