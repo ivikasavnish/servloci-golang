@@ -83,6 +83,7 @@ type (
 		TParamList []*Field // nil means no type parameters
 		Alias      bool
 		Type       Expr
+		Decorators []*Decorator // nil means no decorators (e.g. @serde)
 		decl
 	}
 

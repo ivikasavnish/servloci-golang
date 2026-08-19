@@ -458,8 +458,14 @@ func (p *parser) fileOrNil() *File {
 					d.Decorators = decorators
 					f.DeclList = append(f.DeclList, d)
 				}
+			} else if p.tok == _Type {
+				p.next()
+				if d, ok := p.typeDecl(nil).(*TypeDecl); ok {
+					d.Decorators = decorators
+					f.DeclList = append(f.DeclList, d)
+				}
 			} else {
-				p.syntaxError("decorators can only be applied to functions")
+				p.syntaxError("decorators can only be applied to functions or type declarations")
 				p.advance(_Import, _Const, _Type, _Var, _Func)
 				continue
 			}

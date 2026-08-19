@@ -78,6 +78,7 @@ func LoadPackage(filenames []string) {
 	for _, p := range noders {
 		rewriteDecorators(p.file)
 		rewriteTryOperator(p.file)
+		rewriteSerdeDecorators(p.file)
 	}
 
 	unified(m, noders)
@@ -489,6 +490,306 @@ func tryZero(pos syntax.Pos, typ syntax.Expr) syntax.Expr {
 	deref := &syntax.Operation{Op: syntax.Mul, X: newCall}
 	deref.SetPos(pos)
 	return deref
+}
+
+// rewriteSerdeDecorators finds struct type declarations tagged @serde and
+// generates format-agnostic SerdeEncode/SerdeDecode methods for them,
+// spliced into the file's declaration list before typechecking.
+//
+// The generated pair walks the struct's fields against the Encoder/Decoder
+// interfaces (expected to already be declared in the same package -- same
+// convention as @timed/@logged expecting their wrapper function in scope):
+// one method pair works with any backend (JSON, a length-prefixed binary
+// wire format, etc.) that implements those interfaces, so adding a new
+// format later costs zero new codegen.
+//
+// Implementation note: rather than hand-building syntax.* AST nodes for
+// every statement shape (as rewriteTryOperator does), the generated method
+// bodies are assembled as Go source text and reparsed with syntax.Parse
+// into a small synthetic file, whose FuncDecls are then spliced into the
+// real file.DeclList. Both run at the same pre-typecheck stage, so this is
+// just a more convenient way to build the same kind of AST -- far less
+// error-prone than constructing dozens of statement/expression node types
+// by hand for every field-type shape (string/int/slice/map/pointer/nested
+// struct). A field type this pass can't handle (chan, func, interface{},
+// non-string map keys) is a real compile error at the field's position,
+// not a silently-dropped field.
+//
+// v1 scope: struct types only (no generics), no embedded/anonymous
+// fields, map keys must be string. A field naming another type (e.g.
+// `Address Addr`) is assumed to be another @serde struct; if it isn't,
+// the generated `(v.Address).SerdeEncode(e)` call simply fails to compile
+// with an ordinary "undefined method" error -- same safe-fail philosophy
+// as rewriteTryOperator's unresolvable ? usages.
+func rewriteSerdeDecorators(file *syntax.File) {
+	if file == nil {
+		return
+	}
+	var pm posMap
+	for _, decl := range file.DeclList {
+		td, ok := decl.(*syntax.TypeDecl)
+		if !ok || !hasSerdeDecorator(td.Decorators) {
+			continue
+		}
+		if len(td.TParamList) > 0 {
+			base.ErrorfAt(pm.pos(td), 0, "@serde does not support generic types")
+			continue
+		}
+		st, ok := td.Type.(*syntax.StructType)
+		if !ok {
+			base.ErrorfAt(pm.pos(td), 0, "@serde can only be applied to struct types")
+			continue
+		}
+
+		src, ok := genSerdeSource(&pm, td.Name.Value, st)
+		if !ok {
+			continue // errors already reported at the offending fields
+		}
+
+		synthBase := syntax.NewFileBase(fmt.Sprintf("<serde:%s>", td.Name.Value))
+		synth, err := syntax.Parse(synthBase, strings.NewReader(src), func(e error) {
+			base.Fatalf("gpp: internal error: generated @serde code for %s failed to parse: %v\n---\n%s", td.Name.Value, e, src)
+		}, nil, 0)
+		if err != nil || synth == nil {
+			base.Fatalf("gpp: internal error: generated @serde code for %s failed to parse: %v\n---\n%s", td.Name.Value, err, src)
+		}
+		file.DeclList = append(file.DeclList, synth.DeclList...)
+	}
+}
+
+func hasSerdeDecorator(decorators []*syntax.Decorator) bool {
+	for _, d := range decorators {
+		if d.Name != nil && d.Name.Value == "serde" {
+			return true
+		}
+	}
+	return false
+}
+
+// serde field-type classification, decided purely from the syntax tree
+// (no typecheck available yet).
+type serdeKind int
+
+const (
+	serdeUnsupported serdeKind = iota
+	serdeString
+	serdeInt
+	serdeFloat
+	serdeBool
+	serdeStruct // assumed another @serde-tagged struct, named by a plain identifier
+	serdePointer
+	serdeSlice
+	serdeArray
+	serdeMap
+)
+
+func classifySerdeType(t syntax.Expr) (kind serdeKind, elem syntax.Expr, mapKey syntax.Expr) {
+	switch x := t.(type) {
+	case *syntax.Name:
+		switch x.Value {
+		case "string":
+			return serdeString, nil, nil
+		case "int", "int8", "int16", "int32", "int64",
+			"uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "byte", "rune":
+			return serdeInt, nil, nil
+		case "float32", "float64":
+			return serdeFloat, nil, nil
+		case "bool":
+			return serdeBool, nil, nil
+		default:
+			return serdeStruct, nil, nil
+		}
+	case *syntax.Operation:
+		if x.Op == syntax.Mul && x.Y == nil {
+			return serdePointer, x.X, nil
+		}
+	case *syntax.SliceType:
+		return serdeSlice, x.Elem, nil
+	case *syntax.ArrayType:
+		return serdeArray, x.Elem, nil
+	case *syntax.MapType:
+		return serdeMap, x.Value, x.Key
+	}
+	return serdeUnsupported, nil, nil
+}
+
+// serdeTypeString renders a field type expression back to Go source text,
+// for use in the generated code (var decls, make(), conversions). Only
+// needs to handle the shapes classifySerdeType recognizes.
+func serdeTypeString(t syntax.Expr) string {
+	switch x := t.(type) {
+	case *syntax.Name:
+		return x.Value
+	case *syntax.Operation:
+		if x.Op == syntax.Mul && x.Y == nil {
+			return "*" + serdeTypeString(x.X)
+		}
+	case *syntax.SliceType:
+		return "[]" + serdeTypeString(x.Elem)
+	case *syntax.ArrayType:
+		return "[" + serdeTypeString(x.Len) + "]" + serdeTypeString(x.Elem)
+	case *syntax.MapType:
+		return "map[" + serdeTypeString(x.Key) + "]" + serdeTypeString(x.Value)
+	case *syntax.BasicLit:
+		return x.Value
+	}
+	return ""
+}
+
+// genSerdeSource builds the full Go source (package clause + both method
+// decls) for typeName's SerdeEncode/SerdeDecode pair. ok is false if any
+// field had an unsupported shape (already reported via base.ErrorfAt at
+// that field's position); the caller should skip codegen for this struct
+// in that case.
+func genSerdeSource(pm *posMap, typeName string, st *syntax.StructType) (string, bool) {
+	var enc, dec strings.Builder
+	var fieldNames []string
+	ctr := 0
+	ok := true
+
+	for _, f := range st.FieldList {
+		if f.Name == nil || f.Name.Value == "_" {
+			continue // embedded/anonymous fields unsupported in v1, silently skipped like decorator-on-method
+		}
+		kind, _, mapKey := classifySerdeType(f.Type)
+		if kind == serdeUnsupported {
+			base.ErrorfAt(pm.pos(f.Type), 0, "@serde: field %s.%s has an unsupported type for serialization", typeName, f.Name.Value)
+			ok = false
+			continue
+		}
+		if kind == serdeMap {
+			if ks, isName := mapKey.(*syntax.Name); !isName || ks.Value != "string" {
+				base.ErrorfAt(pm.pos(f.Type), 0, "@serde: field %s.%s: only string-keyed maps are supported", typeName, f.Name.Value)
+				ok = false
+				continue
+			}
+		}
+		fieldNames = append(fieldNames, f.Name.Value)
+		writeSerdeEncodeField(&enc, "v."+f.Name.Value, f.Type, &ctr)
+		writeSerdeDecodeField(&dec, "v."+f.Name.Value, f.Type, &ctr)
+	}
+	if !ok {
+		return "", false
+	}
+
+	var namesLit strings.Builder
+	namesLit.WriteString("[]string{")
+	for i, n := range fieldNames {
+		if i > 0 {
+			namesLit.WriteString(", ")
+		}
+		fmt.Fprintf(&namesLit, "%q", n)
+	}
+	namesLit.WriteString("}")
+
+	var out strings.Builder
+	fmt.Fprintf(&out, "package p\n\nfunc (v %s) SerdeEncode(e Encoder) error {\n", typeName)
+	fmt.Fprintf(&out, "if err := e.EncodeStructStart(%q, %s); err != nil {\nreturn err\n}\n", typeName, namesLit.String())
+	out.WriteString(enc.String())
+	out.WriteString("return e.EncodeStructEnd()\n}\n\n")
+
+	fmt.Fprintf(&out, "func (v *%s) SerdeDecode(d Decoder) error {\n", typeName)
+	fmt.Fprintf(&out, "if err := d.DecodeStructStart(%q, %s); err != nil {\nreturn err\n}\n", typeName, namesLit.String())
+	out.WriteString(dec.String())
+	out.WriteString("return d.DecodeStructEnd()\n}\n")
+
+	return out.String(), true
+}
+
+// writeSerdeEncodeField emits statements that encode the Go expression
+// expr (of type t) via e, appending to w. Recurses for pointer/slice/
+// array/map element types.
+func writeSerdeEncodeField(w *strings.Builder, expr string, t syntax.Expr, ctr *int) {
+	kind, elem, _ := classifySerdeType(t)
+	switch kind {
+	case serdeString:
+		fmt.Fprintf(w, "if err := e.EncodeString(%s); err != nil {\nreturn err\n}\n", expr)
+	case serdeInt:
+		fmt.Fprintf(w, "if err := e.EncodeInt(int64(%s)); err != nil {\nreturn err\n}\n", expr)
+	case serdeFloat:
+		fmt.Fprintf(w, "if err := e.EncodeFloat(float64(%s)); err != nil {\nreturn err\n}\n", expr)
+	case serdeBool:
+		fmt.Fprintf(w, "if err := e.EncodeBool(%s); err != nil {\nreturn err\n}\n", expr)
+	case serdeStruct:
+		fmt.Fprintf(w, "if err := (%s).SerdeEncode(e); err != nil {\nreturn err\n}\n", expr)
+	case serdePointer:
+		fmt.Fprintf(w, "if %s == nil {\nif err := e.EncodeOptional(false); err != nil {\nreturn err\n}\n} else {\nif err := e.EncodeOptional(true); err != nil {\nreturn err\n}\n", expr)
+		writeSerdeEncodeField(w, "(*"+expr+")", elem, ctr)
+		w.WriteString("}\n")
+	case serdeSlice, serdeArray:
+		*ctr++
+		ev := fmt.Sprintf("_gppElem%d", *ctr)
+		fmt.Fprintf(w, "if err := e.EncodeSeqStart(len(%s)); err != nil {\nreturn err\n}\nfor _, %s := range %s {\n", expr, ev, expr)
+		writeSerdeEncodeField(w, ev, elem, ctr)
+		w.WriteString("}\n")
+		w.WriteString("if err := e.EncodeSeqEnd(); err != nil {\nreturn err\n}\n")
+	case serdeMap:
+		*ctr++
+		kv := fmt.Sprintf("_gppKey%d", *ctr)
+		vv := fmt.Sprintf("_gppVal%d", *ctr)
+		fmt.Fprintf(w, "if err := e.EncodeMapStart(len(%s)); err != nil {\nreturn err\n}\nfor %s, %s := range %s {\nif err := e.EncodeString(%s); err != nil {\nreturn err\n}\n", expr, kv, vv, expr, kv)
+		writeSerdeEncodeField(w, vv, elem, ctr)
+		w.WriteString("}\n")
+		w.WriteString("if err := e.EncodeMapEnd(); err != nil {\nreturn err\n}\n")
+	}
+}
+
+// writeSerdeDecodeField emits statements that decode a value of type t
+// from d into the assignable Go expression target, appending to w.
+func writeSerdeDecodeField(w *strings.Builder, target string, t syntax.Expr, ctr *int) {
+	kind, elem, _ := classifySerdeType(t)
+	*ctr++
+	switch kind {
+	case serdeString:
+		tmp := fmt.Sprintf("_gppDec%d", *ctr)
+		fmt.Fprintf(w, "%s, err := d.DecodeString()\nif err != nil {\nreturn err\n}\n%s = %s\n", tmp, target, tmp)
+	case serdeInt:
+		tmp := fmt.Sprintf("_gppDec%d", *ctr)
+		fmt.Fprintf(w, "%s, err := d.DecodeInt()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, serdeTypeString(t), tmp)
+	case serdeFloat:
+		tmp := fmt.Sprintf("_gppDec%d", *ctr)
+		fmt.Fprintf(w, "%s, err := d.DecodeFloat()\nif err != nil {\nreturn err\n}\n%s = %s(%s)\n", tmp, target, serdeTypeString(t), tmp)
+	case serdeBool:
+		tmp := fmt.Sprintf("_gppDec%d", *ctr)
+		fmt.Fprintf(w, "%s, err := d.DecodeBool()\nif err != nil {\nreturn err\n}\n%s = %s\n", tmp, target, tmp)
+	case serdeStruct:
+		fmt.Fprintf(w, "if err := (&%s).SerdeDecode(d); err != nil {\nreturn err\n}\n", target)
+	case serdePointer:
+		present := fmt.Sprintf("_gppPresent%d", *ctr)
+		tmp := fmt.Sprintf("_gppPtr%d", *ctr)
+		typ := serdeTypeString(elem)
+		fmt.Fprintf(w, "%s, err := d.DecodeOptional()\nif err != nil {\nreturn err\n}\nif %s {\nvar %s %s\n", present, present, tmp, typ)
+		writeSerdeDecodeField(w, tmp, elem, ctr)
+		fmt.Fprintf(w, "%s = &%s\n} else {\n%s = nil\n}\n", target, tmp, target)
+	case serdeSlice:
+		n := fmt.Sprintf("_gppN%d", *ctr)
+		sl := fmt.Sprintf("_gppSl%d", *ctr)
+		ev := fmt.Sprintf("_gppSE%d", *ctr)
+		typ := serdeTypeString(elem)
+		fmt.Fprintf(w, "%s, err := d.DecodeSeqStart()\nif err != nil {\nreturn err\n}\n%s := make([]%s, %s)\nfor i := 0; i < %s; i++ {\nvar %s %s\n", n, sl, typ, n, n, ev, typ)
+		writeSerdeDecodeField(w, ev, elem, ctr)
+		fmt.Fprintf(w, "%s[i] = %s\n}\n", sl, ev)
+		fmt.Fprintf(w, "if err := d.DecodeSeqEnd(); err != nil {\nreturn err\n}\n%s = %s\n", target, sl)
+	case serdeArray:
+		n := fmt.Sprintf("_gppN%d", *ctr)
+		sl := fmt.Sprintf("_gppSl%d", *ctr)
+		ev := fmt.Sprintf("_gppSE%d", *ctr)
+		typ := serdeTypeString(elem)
+		fmt.Fprintf(w, "%s, err := d.DecodeSeqStart()\nif err != nil {\nreturn err\n}\n%s := make([]%s, %s)\nfor i := 0; i < %s; i++ {\nvar %s %s\n", n, sl, typ, n, n, ev, typ)
+		writeSerdeDecodeField(w, ev, elem, ctr)
+		fmt.Fprintf(w, "%s[i] = %s\n}\n", sl, ev)
+		fmt.Fprintf(w, "if err := d.DecodeSeqEnd(); err != nil {\nreturn err\n}\ncopy(%s[:], %s)\n", target, sl)
+	case serdeMap:
+		n := fmt.Sprintf("_gppN%d", *ctr)
+		mp := fmt.Sprintf("_gppMp%d", *ctr)
+		kv := fmt.Sprintf("_gppMk%d", *ctr)
+		vv := fmt.Sprintf("_gppMv%d", *ctr)
+		typ := serdeTypeString(elem)
+		fmt.Fprintf(w, "%s, err := d.DecodeMapStart()\nif err != nil {\nreturn err\n}\n%s := make(map[string]%s, %s)\nfor i := 0; i < %s; i++ {\n%s, err := d.DecodeString()\nif err != nil {\nreturn err\n}\nvar %s %s\n", n, mp, typ, n, n, kv, vv, typ)
+		writeSerdeDecodeField(w, vv, elem, ctr)
+		fmt.Fprintf(w, "%s[%s] = %s\n}\n", mp, kv, vv)
+		fmt.Fprintf(w, "if err := d.DecodeMapEnd(); err != nil {\nreturn err\n}\n%s = %s\n", target, mp)
+	}
 }
 
 // trimFilename returns the "trimmed" filename of b, which is the
